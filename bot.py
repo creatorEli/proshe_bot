@@ -6,9 +6,19 @@ from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from db_funcs import init_db, add_route_db, get_all_routes, get_route_by_topic, save_post_db, mark_post_sent, reset_posts_for_route, get_random_unsent_post
 from config import ADMIN_ID, API_TOKEN, MAIN_SOURCE_CHAT_ID, TIMEZONE
-
+from db_funcs import (
+    init_db,
+    add_route_db,
+    get_all_routes,
+    get_route_by_topic,
+    save_post_db,
+    mark_post_sent,
+    reset_posts_for_route,
+    get_random_unsent_post,
+    get_route_by_id,
+    delete_route_db
+)
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
@@ -16,7 +26,7 @@ router = Router()
 dp.include_router(router)
 
 logging.basicConfig(level=logging.INFO)
-scheduler = AsyncIOScheduler(TIMEZONE)
+scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
 
 # ЛОГИКА БОТА
@@ -42,13 +52,16 @@ async def send_random_post_job(route_id: int, target_chat_id: int):
             from_chat_id=MAIN_SOURCE_CHAT_ID,
             message_id=post['message_id']
         )
-        mark_post_sent(post[id])
+        mark_post_sent(post['id'])
         logging.info(f"Пост {post['message_id']} отправлен в чат {target_chat_id}")
     except Exception as e:
         logging.error(f"Ошибка отправки: {e}")
 
 @router.message(F.chat.id == MAIN_SOURCE_CHAT_ID)
 async def collect_post(message: types.Message):
+    if message.text and message.text.startswith("/"):
+        return
+    
     # Слушаем главный чат. Если сообщение пришло в топик из нашего списка маршрутов - сохраняем
     topic_id = message.message_thread_id
 
@@ -64,11 +77,12 @@ async def collect_post(message: types.Message):
             save_post_db(route['id'], message.message_id)
             logging.info(f"Пост {message.message_id} сохранен для маршрута {route['id']}")
     
-# -- Админ команды для управления маршрутами ---
+# --- Админ команды для управления маршрутами ---
 
 @router.message(Command("add_route"), F.from_user.id == ADMIN_ID)
 async def cmd_add_route(message: types.Message):
     # формат /add_route <ID_топика> <ID_целевого_чата> <время ЧЧ:ММ>
+    assert message.text is not None
     args = message.text.split()
     if len(args) != 4:
         await message.answer("Дорогой, используй такой формат: `/add_route <ID_топика> <ID_чата> <ЧЧ:ММ>`\nПример: `/add_route 000 -100998877 15:30`", parse_mode="Markdown")
@@ -111,6 +125,59 @@ async def cmd_list_routes(message: types.Message):
         text += f"ID `{r['id']}`: Топик `{r['source_topic_id']}` -> Чат `{r['target_chat_id']}` (в {r['send_time']})\n"
     await message.answer(text, parse_mode="Markdown")
 
+@router.message(Command("delete_route"), F.from_user.id == ADMIN_ID)
+async def cmd_delete_route(message: types.Message):
+    if not message.text:
+        return
+
+    args = message.text.split()
+    
+    if len(args) != 2:
+        await message.answer(
+            "Дорогой, используй формат:\n"
+            "`/delete_route <ID_маршрута>`\n\n"
+            "Например так:\n"
+            "`/delete_route 1`",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        route_id = int(args[1])
+    except ValueError:
+        await message.answer("Прости, но мне нужно числовой идентификатор маршрута. Я не умею читать его словами :((")
+        return
+
+    job_id = f"route_{route_id}"
+
+    # Сначала убираем задачу из планировщика, если она там есть
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+        logging.info(f"Планировщик: задача {job_id} удалена")
+
+    route = get_route_by_id(route_id)
+
+    if not route:
+        await message.answer(
+            f"Я не смогла найти маршрут с ID {route_id}. Мне очень жаль",
+            parse_mode="Markdown"
+        )
+        return
+
+    deleted = delete_route_db(route_id)
+
+    if(deleted):
+        await message.answer(
+            f"Ура, я удалила маршрут {route_id}!\n"
+            f"Топик `{route['source_topic_id']}` -> Чат `{route['target_chat_id']}`.",
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer(
+            f"Не удалось удалить маршрут `{route_id}` из базы.",
+            parse_mode="Markdown"
+        )
+    
 
 @router.message(Command("start"))
 async def cmd_start(message: types.Message):

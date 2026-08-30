@@ -90,3 +90,30 @@ def reset_posts_for_route(route_id):
     c.execute('UPDATE posts SET is_sent = 0 WHERE route_id = ?', (route_id,))
     conn.commit()
     conn.close()
+
+def get_route_by_id(route_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM routes WHERE id = ?", (route_id,))
+    route = c.fetchone()
+    conn.close()
+    return route
+
+def delete_route_db(route_id):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        c = conn.cursor()
+
+        # Сначала удаляем посты, связанные с маршрутом
+        c.execute('DELETE FROM posts WHERE route_id = ?', (route_id,))
+
+        # Затем удаляем сам маршрут
+        c.execute('DELETE FROM routes WHERE id = ?', (route_id,))
+
+        deleted = c.rowcount
+        conn.commit()
+
+        return deleted > 0
+    finally:
+        conn.close()
