@@ -584,6 +584,7 @@ async def send_random_post_job(route_id: int):
             f"Пост из {len(message_ids)} сообщений отправлен "
             f"в чат {target_chat_id} (topic={target_topic_id or 'нет'})"
         )
+        return True
 
     except Exception as e:
         logging.error(f"Ошибка отправки: {e}")
