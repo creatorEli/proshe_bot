@@ -285,7 +285,142 @@ async def cmd_delete_route(message: types.Message):
             f"Не удалось удалить маршрут `{route_id}` из базы.",
             parse_mode="Markdown"
         )
+
+
+@router.message(Command("import_message"), F.from_user.id == ADMIN_ID)
+async def cmd_import_message(message: types.Message):
+    """
+    Импортирует конкретное сообщение по ID топика и ID сообщения.
+    Формат: /import_message <ID_топика> <ID_сообщения>
+    """
+    if not message.text:
+        return
     
+    args = message.text.split()
+    
+    if len(args) != 3:
+        await message.answer(
+            "Используй формат:\n"
+            "`/import_message <ID_топика> <ID_сообщения>`\n\n"
+            "Пример:\n"
+            "`/import_message 123 456`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        topic_id = int(args[1])
+        message_id = int(args[2])
+    except ValueError:
+        await message.answer("ID должны быть числами.")
+        return
+    
+    # Проверяем, есть ли маршрут для этого топика
+    route = get_route_by_topic(topic_id)
+    
+    if not route:
+        await message.answer(
+            f"Маршрут для топика `{topic_id}` не найден.\n"
+            "Сначала добавь маршрут через `/add_route`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Пытаемся скопировать сообщение, чтобы проверить его существование
+    try:
+        # Проверяем, что сообщение существует и доступно
+        await bot.copy_message(
+            chat_id=message.chat.id,  # Копируем обратно отправителю для проверки
+            from_chat_id=MAIN_SOURCE_CHAT_ID,
+            message_id=message_id
+        )
+        
+        # Если успешно, сохраняем в базу
+        save_post_db(route['id'], [message_id])
+        
+        await message.answer(
+            f"Сообщение `{message_id}` из топика `{topic_id}` импортировано!",
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        await message.answer(
+            f"Не удалось импортировать сообщение:\n`{e}`",
+            parse_mode="Markdown"
+        )
+
+
+@router.message(Command("import_range"), F.from_user.id == ADMIN_ID)
+async def cmd_import_range(message: types.Message):
+    """
+    Импортирует диапазон сообщений из топика.
+    Формат: /import_range <ID_топика> <начальный_ID> <конечный_ID>
+    """
+    if not message.text:
+        return
+    
+    args = message.text.split()
+    
+    if len(args) != 4:
+        await message.answer(
+            "Используй формат:\n"
+            "`/import_range <ID_топика> <начальный_ID> <конечный_ID>`\n\n"
+            "Пример:\n"
+            "`/import_range 123 100 150`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        topic_id = int(args[1])
+        start_id = int(args[2])
+        end_id = int(args[3])
+    except ValueError:
+        await message.answer("Все параметры должны быть числами.")
+        return
+    
+    if start_id > end_id:
+        await message.answer("Начальный ID должен быть меньше конечного.")
+        return
+    
+    route = get_route_by_topic(topic_id)
+    
+    if not route:
+        await message.answer(
+            f"Маршрут для топика `{topic_id}` не найден.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    await message.answer(f"Начинаю импорт сообщений с {start_id} по {end_id}...")
+    
+    imported_count = 0
+    failed_count = 0
+    
+    for msg_id in range(start_id, end_id + 1):
+        try:
+            # Пытаемся скопировать сообщение для проверки
+            await bot.copy_message(
+                chat_id=message.chat.id,
+                from_chat_id=MAIN_SOURCE_CHAT_ID,
+                message_id=msg_id
+            )
+            
+            # Сохраняем
+            save_post_db(route['id'], [msg_id])
+            imported_count += 1
+            
+        except Exception:
+            failed_count += 1
+        
+        # Небольшая задержка, чтобы не превысить лимиты API
+        await asyncio.sleep(0.1)
+    
+    await message.answer(
+        f"Импорт завершён!\n"
+        f"Успешно: {imported_count}\n"
+        f"Не удалось: {failed_count}"
+    )
 
 @router.message(Command("start"))
 async def cmd_start(message: types.Message):
