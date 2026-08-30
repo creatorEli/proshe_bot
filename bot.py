@@ -27,157 +27,68 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
+commands_router = Router()
+collector_router = Router()
+
+dp.include_router(commands_router)
+dp.include_router(collector_router)
+
+
 logging.basicConfig(level=logging.INFO)
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
-
 
 # Словарь для агрегации галерей
 media_groups = defaultdict(list)
 media_group_timers = {}
 
-# ЛОГИКА БОТА
 
-async def send_random_post_job(route_id: int):
-    # задача планировщика для конкретного маршрута
-    route = get_route_by_id(route_id)
-    if not route:
-        logging.warning(f"Маршрут {route_id} не найден. Пропускаю отправку.")
-        return
+HELP_TEXT = (
+    "Привет! Я бот для автоматической отправки постов по маршрутам.\n"
+    "Используй команды ниже.\n\n"
 
-    logging.info(f"Сработка маршрута {route_id}. Ищем пост...")
+    "Основные команды:\n"
+    "`/start` - приветствие\n"
+    "`/help` - эта справка\n"
+    "`/routes` - показать сохранённые маршруты (только админ)\n\n"
 
-    source_chat_id = route['source_chat_id'] or MAIN_SOURCE_CHAT_ID
-    target_chat_id = route['target_chat_id']
-    target_topic_id = route['target_topic_id'] or 0
+    "Добавление маршрута:\n"
+    "Старый формат:\n"
+    "`/add_route <ID топика> <ID чата> <ЧЧ:ММ>`\n\n"
+    "Новый формат:\n"
+    "`/add_route <ID чата источника> <ID топика источника> <ID целевого чата> <ID целевого топика> <ЧЧ:ММ>`\n\n"
 
-    post = get_random_unsent_post(route_id)
-    
+    "Условия:\n"
+    "`0` вместо чата источника - использовать основной чат из конфига\n"
+    "`0` вместо топика источника - брать весь чат источника целиком\n"
+    "`0` вместо целевого топика - отправлять без топика, в общий поток\n\n"
 
-    # Если все посты из базы уже отправлены, сбрасываем флаги и берём заново
-    if not post:
-        logging.info("Все посты отправлены. Сбрасываем флаги для нового цикла")
-        reset_posts_for_route(route_id)
-        post = get_random_unsent_post(route_id)
-    
-    if not post:
-        logging.warning(f"В маршруте {route_id} вообще нет постов!")
-        return
+    "Примеры:\n"
+    "`/add_route 123 -100998877 15:30`\n"
+    "`/add_route 0 123 -100998877 0 15:30`\n"
+    "`/add_route -100111222333 0 -100998877 45 18:20`\n\n"
 
-    message_ids = sorted(post['message_ids'])
-    if not message_ids:
-        logging.warning(f"Пост {post['id']} из маршрута {route_id} пустой.")
-        return False
+    "Управление маршрутами:\n"
+    "`/send_now <ID маршрута>` - отправить пост из маршрута прямо сейчас (только админ)\n"
+    "`/delete_route <ID маршрута>` - удалить маршрут (только админ)\n\n"
 
-    logging.info(f"Отправляем сообщения: {message_ids}")
-
-    # Если указан целевой топик, добавляем message_thread_id
-    send_kwargs = {}
-    if target_topic_id:
-        send_kwargs['message_thread_id'] = target_topic_id
-
-    try:
-        # Проверяем, доступен ли copy_messages (для галерей)
-        if len(message_ids) > 1 and hasattr(bot, 'copy_messages'):
-            await bot.copy_messages(
-                chat_id=target_chat_id,
-                from_chat_id=source_chat_id,
-                message_ids=message_ids,
-                **send_kwargs
-            )
-        else:
-            for message_id in message_ids:
-                await bot.copy_message(
-                    chat_id=target_chat_id,
-                    from_chat_id=source_chat_id,
-                    message_id=message_id,
-                    **send_kwargs
-                )
-        mark_post_sent(post['id'])
-        logging.info(
-            f"Пост из {len(message_ids)} сообщений отправлен "
-            f"в чат {target_chat_id} (topic={target_topic_id or 'нет'})"
-        )
-
-    except Exception as e:
-        logging.error(f"Ошибка отправки: {e}")
-        return False
+    "Импорт старых сообщений:\n"
+    "`/import_message <ID маршрута> <ID сообщения>` - импортировать одно сообщение (только админ)\n"
+    "`/import_range <ID маршрута> <начальный ID> <конечный ID>` - импортировать диапазон сообщений (только админ)\n"
+)
 
 
-@router.message()
-async def collect_post(message: types.Message):
-    """
-    Слушаем сообщения из чатов и сохраняем их, если есть подходящий маршрут.
-    """
-    # Приватные диалоги с ботом не используем как источник постов
-    if message.chat.type == 'private':
-        return
 
-    # Игнорируем команды
-    if message.text and message.text.startswith('/'):
-        return
-
-    # Игнорируем сообщения без контента
-    if not (
-        message.text or
-        message.photo or
-        message.video or
-        message.document or
-        message.animation
-    ):
-        return
-
-    chat_id = message.chat.id
-    topic_id = message.message_thread_id or 0
-
-    # Ищем маршруты, которые подходят для этого чата и топика
-    routes = get_routes_for_source(chat_id, topic_id)
-
-    if not routes:
-        return
-
-    media_group_id = message.media_group_id
-
-    if media_group_id:
-        # Это часть галереи.
-        # Ключ теперь включает маршрут, чтобы поддерживать несколько маршрутов.
-        for route in routes:
-            key = (route['id'], media_group_id)
-
-            media_groups[key].append(message.message_id)
-
-            # Отменяем предыдущий таймер, если он уже был
-            if key in media_group_timers:
-                media_group_timers[key].cancel()
-
-            # Запускаем новый таймер.
-            # Дефолтные аргументы нужны, чтобы функция правильно запомнила текущий маршрут.
-            async def save_media_group(key=key, route_id=route['id']):
-                await asyncio.sleep(5)
-
-                message_ids = sorted(media_groups.pop(key, []))
-                media_group_timers.pop(key, None)
-
-                if message_ids:
-                    save_post_db(route_id, message_ids)
-                    logging.info(
-                        f"Галерея из {len(message_ids)} сообщений "
-                        f"сохранена для маршрута {route_id}"
-                    )
-
-            task = asyncio.create_task(save_media_group())
-            media_group_timers[key] = task
-
-    else:
-        # Одиночное сообщение - сохраняем сразу для всех подходящих маршрутов
-        for route in routes:
-            save_post_db(route['id'], [message.message_id])
-            logging.info(
-                f"Пост {message.message_id} сохранён для маршрута {route['id']}"
-            )
-    
 # --- Админ команды для управления маршрутами ---
+@commands_router.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer(HELP_TEXT, parse_mode="Markdown")
 
-@router.message(Command("add_route"), F.from_user.id == ADMIN_ID)
+@commands_router.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer("Привет милый! Используй /help если хочешь посмотреть список всех команд")
+
+
+@commands_router.message(Command("add_route"), F.from_user.id == ADMIN_ID)
 async def cmd_add_route(message: types.Message):
     assert message.text is not None
 
@@ -270,7 +181,7 @@ async def cmd_add_route(message: types.Message):
         await message.answer(f"Дорогой, ты, кажется, ошибся: {e}\n\n{help_text}", parse_mode="Markdown")
 
 
-@router.message(Command("routes"), F.from_user.id == ADMIN_ID)
+@commands_router.message(Command("routes"), F.from_user.id == ADMIN_ID)
 async def cmd_list_routes(message: types.Message):
     routes = get_all_routes()
 
@@ -306,7 +217,7 @@ async def cmd_list_routes(message: types.Message):
     await message.answer(text, parse_mode="Markdown")
 
 
-@router.message(Command("send_now"), F.from_user.id == ADMIN_ID)
+@commands_router.message(Command("send_now"), F.from_user.id == ADMIN_ID)
 async def cmd_send_now(message: types.Message):
     if not message.text:
         return
@@ -354,9 +265,8 @@ async def cmd_send_now(message: types.Message):
     #     await message.answer(f"Прости, я не смогла отправить сообщение.\nВот ошибка:\n{e}")
     #     logging.error(f"Ошибка мгновенной отправки: {e}")
 
-        
 
-@router.message(Command("delete_route"), F.from_user.id == ADMIN_ID)
+@commands_router.message(Command("delete_route"), F.from_user.id == ADMIN_ID)
 async def cmd_delete_route(message: types.Message):
     if not message.text:
         return
@@ -425,8 +335,7 @@ async def cmd_delete_route(message: types.Message):
         )
 
 
-
-@router.message(Command("import_message"), F.from_user.id == ADMIN_ID)
+@commands_router.message(Command("import_message"), F.from_user.id == ADMIN_ID)
 async def cmd_import_message(message: types.Message):
     """
     Импортирует конкретное сообщение по ID маршрута и ID сообщения.
@@ -526,7 +435,7 @@ async def cmd_import_message(message: types.Message):
     #     )
 
 
-@router.message(Command("import_range"), F.from_user.id == ADMIN_ID)
+@commands_router.message(Command("import_range"), F.from_user.id == ADMIN_ID)
 async def cmd_import_range(message: types.Message):
     """
     Импортирует диапазон сообщений по ID маршрута.
@@ -612,14 +521,166 @@ async def cmd_import_range(message: types.Message):
     )
 
 
-@router.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.answer("Привет милый! Используй /routes если хочешь посмотреть все маршруты")
 
+# ЛОГИКА БОТА
+
+async def send_random_post_job(route_id: int):
+    # задача планировщика для конкретного маршрута
+    route = get_route_by_id(route_id)
+    if not route:
+        logging.warning(f"Маршрут {route_id} не найден. Пропускаю отправку.")
+        return
+
+    logging.info(f"Сработка маршрута {route_id}. Ищем пост...")
+
+    source_chat_id = route['source_chat_id'] or MAIN_SOURCE_CHAT_ID
+    target_chat_id = route['target_chat_id']
+    target_topic_id = route['target_topic_id'] or 0
+
+    post = get_random_unsent_post(route_id)
+    
+
+    # Если все посты из базы уже отправлены, сбрасываем флаги и берём заново
+    if not post:
+        logging.info("Все посты отправлены. Сбрасываем флаги для нового цикла")
+        reset_posts_for_route(route_id)
+        post = get_random_unsent_post(route_id)
+    
+    if not post:
+        logging.warning(f"В маршруте {route_id} вообще нет постов!")
+        return
+
+    message_ids = sorted(post['message_ids'])
+    if not message_ids:
+        logging.warning(f"Пост {post['id']} из маршрута {route_id} пустой.")
+        return False
+
+    logging.info(f"Отправляем сообщения: {message_ids}")
+
+    # Если указан целевой топик, добавляем message_thread_id
+    send_kwargs = {}
+    if target_topic_id:
+        send_kwargs['message_thread_id'] = target_topic_id
+
+    try:
+        # Проверяем, доступен ли copy_messages (для галерей)
+        if len(message_ids) > 1 and hasattr(bot, 'copy_messages'):
+            await bot.copy_messages(
+                chat_id=target_chat_id,
+                from_chat_id=source_chat_id,
+                message_ids=message_ids,
+                **send_kwargs
+            )
+        else:
+            for message_id in message_ids:
+                await bot.copy_message(
+                    chat_id=target_chat_id,
+                    from_chat_id=source_chat_id,
+                    message_id=message_id,
+                    **send_kwargs
+                )
+        mark_post_sent(post['id'])
+        logging.info(
+            f"Пост из {len(message_ids)} сообщений отправлен "
+            f"в чат {target_chat_id} (topic={target_topic_id or 'нет'})"
+        )
+
+    except Exception as e:
+        logging.error(f"Ошибка отправки: {e}")
+        return False
+
+
+@collector_router.message()
+async def collect_post(message: types.Message):
+    """
+    Слушаем сообщения из чатов и сохраняем их, если есть подходящий маршрут.
+    """
+    # Приватные диалоги с ботом не используем как источник постов
+    if message.chat.type == 'private':
+        return
+
+    # Игнорируем команды
+    if message.text and message.text.startswith('/'):
+        return
+
+    # Игнорируем сообщения без контента
+    if not (
+        message.text or
+        message.photo or
+        message.video or
+        message.document or
+        message.animation
+    ):
+        return
+
+    chat_id = message.chat.id
+    topic_id = message.message_thread_id or 0
+
+    # Ищем маршруты, которые подходят для этого чата и топика
+    routes = get_routes_for_source(chat_id, topic_id)
+
+    if not routes:
+        return
+
+    media_group_id = message.media_group_id
+
+    if media_group_id:
+        # Это часть галереи.
+        # Ключ теперь включает маршрут, чтобы поддерживать несколько маршрутов.
+        for route in routes:
+            key = (route['id'], media_group_id)
+
+            media_groups[key].append(message.message_id)
+
+            # Отменяем предыдущий таймер, если он уже был
+            if key in media_group_timers:
+                media_group_timers[key].cancel()
+
+            # Запускаем новый таймер.
+            # Дефолтные аргументы нужны, чтобы функция правильно запомнила текущий маршрут.
+            async def save_media_group(key=key, route_id=route['id']):
+                await asyncio.sleep(5)
+
+                message_ids = sorted(media_groups.pop(key, []))
+                media_group_timers.pop(key, None)
+
+                if message_ids:
+                    save_post_db(route_id, message_ids)
+                    logging.info(
+                        f"Галерея из {len(message_ids)} сообщений "
+                        f"сохранена для маршрута {route_id}"
+                    )
+
+            task = asyncio.create_task(save_media_group())
+            media_group_timers[key] = task
+
+    else:
+        # Одиночное сообщение - сохраняем сразу для всех подходящих маршрутов
+        for route in routes:
+            save_post_db(route['id'], [message.message_id])
+            logging.info(
+                f"Пост {message.message_id} сохранён для маршрута {route['id']}"
+            )
+
+async def set_bot_commands():
+    await bot.set_my_commands(
+        [
+            types.BotCommand(command="start", description="Запуск бота"),
+            types.BotCommand(command="help", description="Справка по командам"),
+            types.BotCommand(command="routes", description="Список маршрутов"),
+            types.BotCommand(command="add_route", description="Добавить маршрут"),
+            types.BotCommand(command="send_now", description="Отправить пост сейчас"),
+            types.BotCommand(command="delete_route", description="Удалить маршрут"),
+            types.BotCommand(command="import_message", description="Импортировать одно сообщение"),
+            types.BotCommand(command="import_range", description="Импортировать диапазон сообщений"),
+        ]
+    )
+    
 # LAUNCH
-
 async def main():
     init_db()
+
+    await set_bot_commands()
 
     # При старте бота подгружаем все маршруты из БД в планировщик
     routes = get_all_routes()
@@ -640,6 +701,7 @@ async def main():
     scheduler.start()
     logging.info("Бот запущен и слушает топики...")
     await dp.start_polling(bot)
+
 
 if __name__ == '__main__':
     try:
