@@ -5,6 +5,7 @@ import logging
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from collections import defaultdict
 
 from config import ADMIN_ID, API_TOKEN, MAIN_SOURCE_CHAT_ID, TIMEZONE
 from db_funcs import (
@@ -29,11 +30,16 @@ logging.basicConfig(level=logging.INFO)
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
 
+# Словарь для агрегации галерей
+media_groups = defaultdict(list)
+media_group_timers = {}
+
 # ЛОГИКА БОТА
 
 async def send_random_post_job(route_id: int, target_chat_id: int):
     # задача планировщика для конкретного маршрута
     logging.info(f"Сработка маршрута {route_id}. Ищем пост...")
+
     post = get_random_unsent_post(route_id)
 
     # Если все посты из базы уже отправлены, сбрасываем флаги и берём заново
@@ -45,37 +51,94 @@ async def send_random_post_job(route_id: int, target_chat_id: int):
     if not post:
         logging.warning(f"В маршруте {route_id} вообще нет постов!")
         return
-    
+
+    message_ids = sorted(post['message_ids'])
+    logging.info(f"Отправляем сообщения: {message_ids}")
+
     try:
-        await bot.copy_message(
-            chat_id=target_chat_id,
-            from_chat_id=MAIN_SOURCE_CHAT_ID,
-            message_id=post['message_id']
-        )
+        # Проверяем, доступен ли copy_messages (для галерей)
+        if len(message_ids) > 1 and hasattr(bot, 'copy_messages'):
+            await bot.copy_messages(
+                chat_id=target_chat_id,
+                from_chat_id=MAIN_SOURCE_CHAT_ID,
+                message_ids=message_ids
+            )
+        else:
+            for message_id in message_ids:
+                await bot.copy_message(
+                    chat_id=target_chat_id,
+                    from_chat_id=MAIN_SOURCE_CHAT_ID,
+                    message_id=message_id
+                )
         mark_post_sent(post['id'])
-        logging.info(f"Пост {post['message_id']} отправлен в чат {target_chat_id}")
+        logging.info(f"Пост из {len(message_ids)} сообщений отправлен в чат {target_chat_id}")
+
     except Exception as e:
         logging.error(f"Ошибка отправки: {e}")
 
+    # try:
+    #     await bot.copy_message(
+    #         chat_id=target_chat_id,
+    #         from_chat_id=MAIN_SOURCE_CHAT_ID,
+    #         message_id=post['message_id']
+    #     )
+    #     mark_post_sent(post['id'])
+    #     logging.info(f"Пост {post['message_id']} отправлен в чат {target_chat_id}")
+    # except Exception as e:
+    #     logging.error(f"Ошибка отправки: {e}")
+
 @router.message(F.chat.id == MAIN_SOURCE_CHAT_ID)
 async def collect_post(message: types.Message):
+    # Игнорируем команды
     if message.text and message.text.startswith("/"):
+        return
+
+    # Игнорируем сообщения без контента
+    if not (message.text or message.photo or message.video or message.document or message.animation):
         return
     
     # Слушаем главный чат. Если сообщение пришло в топик из нашего списка маршрутов - сохраняем
     topic_id = message.message_thread_id
-
     # если сообщение не в топике, игнорируем
     if not topic_id: 
         return
 
     # Проверяем, что этот топик в наших маршрутах
     route = get_route_by_topic(topic_id)
-    if route:
-        # Сохраняем только если есть контент
-        if message.text or message.photo or message.video or message.document or message.animation:
-            save_post_db(route['id'], message.message_id)
-            logging.info(f"Пост {message.message_id} сохранен для маршрута {route['id']}")
+    if not route:
+        return
+
+    media_group_id = message.media_group_id
+
+    if media_group_id:
+        # Это часть галереи - добавляем в группу
+        media_groups[media_group_id].append(message.message_id)
+
+        # Отменяем предыдущий таймер если есть
+        if media_group_id in media_group_timers:
+            media_group_timers[media_group_id].cancel()
+
+        # Запускаем новый таймер на 5 секунды
+        async def save_media_group():
+            await asyncio.sleep(5)
+
+            message_ids = sorted(media_groups.pop(media_group_id, []))
+            media_group_timers.pop(media_group_id, None)
+
+            if(message_ids):
+                save_post_db(route['id'], message_ids)
+                logging.info(
+                    f"Галерея из {len(message_ids)} сообщений сохранена для маршрута {route['id']}"
+                )
+
+        task = asyncio.create_task(save_media_group())
+        media_group_timers[media_group_id] = task
+        
+    else:
+        # Одиночное сообщение - сохраняем сразу
+        save_post_db(route['id'], [message.message_id])
+        logging.info(f"Пост {message.message_id} сохранен для маршрута {route['id']}")
+
     
 # --- Админ команды для управления маршрутами ---
 
@@ -112,6 +175,8 @@ async def cmd_add_route(message: types.Message):
     except Exception as e:
         await message.answer(f"Дорогой, ты, кажется, ошибся: {e}")
 
+
+
 @router.message(Command("routes"), F.from_user.id == ADMIN_ID)
 async def cmd_list_routes(message: types.Message):
     routes = get_all_routes()
@@ -124,6 +189,49 @@ async def cmd_list_routes(message: types.Message):
     for r in routes:
         text += f"ID `{r['id']}`: Топик `{r['source_topic_id']}` -> Чат `{r['target_chat_id']}` (в {r['send_time']})\n"
     await message.answer(text, parse_mode="Markdown")
+
+@router.message(Command("send_now"), F.from_user.id == ADMIN_ID)
+async def cmd_send_now(message: types.Message):
+    if not message.text:
+        return
+
+    args = message.text.split()
+
+    if len(args) != 2:
+        await message.answer(
+            "Дорогой, используй формат:\n"
+            "`/send_now <ID_маршрута>`\n\n"
+            "Например такой:\n"
+            "`/send_now 1`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        route_id = int(args[1])
+    except ValueError:
+        await message.answer("Прости, но мне нужен числовой идентификатор маршрута.")
+        return
+
+    route = get_route_by_id(route_id)
+
+    if not route:
+        await message.answer(
+            f"Я не смогла найти маршрут с ID {route_id}. Проверь `/routes`",
+            parse_mode="Markdown"
+        )
+        return
+
+    target_chat_id = route['target_chat_id']
+    await message.answer(f"Пытаюсь отправить пост из маршрута {route_id}...")
+
+    try:
+        await send_random_post_job(route_id, target_chat_id)
+        await message.answer("Готово! Проверь целевой чат :)")
+    except Exception as e:
+        await message.answer(f"Прости, я не смогла отправить сообщение. \nВот ошибка:\n{e}")
+        logging.error(f"Ошибка мгновенной отправки: {e}")
+    
 
 @router.message(Command("delete_route"), F.from_user.id == ADMIN_ID)
 async def cmd_delete_route(message: types.Message):
