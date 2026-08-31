@@ -7,20 +7,22 @@ from config import DB_NAME, MAIN_SOURCE_CHAT_ID
 # Получаем абсолютный путь к папке, где лежит бот bot.py
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Формируем полный путь к файлу бд
-DB_PATH = os.path.join(BASE_DIR, DB_NAME)
+# DB_PATH = os.path.join(BASE_DIR, DB_NAME)
+DB_PATH = "./../data/bot_scalable.db"# + DB_NAME
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
     c.execute('''CREATE TABLE IF NOT EXISTS routes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_chat_id INTEGER DEFAULT 0,
-                    source_topic_id INTEGER DEFAULT 0,
-                    target_chat_id INTEGER,
-                    target_topic_id INTEGER DEFAULT 0,
-                    send_time TEXT
-                )''')
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 source_chat_id INTEGER DEFAULT 0,
+                 source_topic_id INTEGER DEFAULT 0,
+                 target_chat_id INTEGER,
+                 target_topic_id INTEGER DEFAULT 0,
+                 send_time TEXT,
+                 interval_seconds INTEGER DEFAULT 86400
+             )''')
 
 
     # Аккуратная миграция для старой таблицы routes
@@ -33,6 +35,8 @@ def init_db():
     if 'target_topic_id' not in route_columns:
         c.execute('ALTER TABLE routes ADD COLUMN target_topic_id INTEGER DEFAULT 0')
 
+    if 'interval_seconds' not in route_columns:
+        c.execute('ALTER TABLE routes ADD COLUMN interval_seconds INTEGER DEFAULT 86400')
     
     # Таблица постов: один пост может содержать несколько message_id,
     # например галерею. Храним список как JSON.
@@ -75,20 +79,25 @@ def init_db():
     conn.close()
 
 
-def add_route_db(source_chat_id, source_topic_id, target_chat_id, target_topic_id, send_time):
+def add_route_db(source_chat_id, source_topic_id, target_chat_id, target_topic_id, send_time=None, interval_seconds=0):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
+    send_time = send_time or None
+    interval_seconds = int(interval_seconds or 0)
+
     c.execute(
         '''INSERT INTO routes
-           (source_chat_id, source_topic_id, target_chat_id, target_topic_id, send_time)
-           VALUES (?, ?, ?, ?, ?)''',
+           (source_chat_id, source_topic_id, target_chat_id, target_topic_id,
+            send_time, interval_seconds)
+           VALUES (?, ?, ?, ?, ?, ?)''',
         (
             source_chat_id or 0,
             source_topic_id or 0,
             target_chat_id,
             target_topic_id or 0,
-            send_time
+            send_time,
+            interval_seconds
         )
     )
 

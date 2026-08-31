@@ -16,6 +16,9 @@ venv/
 env/
 ENV/
 .venv
+.env
+*.yml
+requirements.txt
 
 # IDE
 .vscode/
