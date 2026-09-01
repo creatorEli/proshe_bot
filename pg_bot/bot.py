@@ -412,18 +412,13 @@ async def cmd_send_now(message: types.Message):
 
     await message.answer(f"Пытаюсь отправить пост из маршрута {route_id}...")
 
-    sent = await send_random_post_job(route_id)
+    sent = await send_random_post_job(route_id, manual_send=True)
 
     if sent:
-        # Пересоздаём задачу, чтобы планировщик учитывал новый next_run_time
-        updated_route = get_route_by_id(route_id)
-        if updated_route:
-            schedule_route_job(updated_route)
-
         await message.answer("Готово! Проверь целевой чат :)")
     else:
         await message.answer("Не получилось отправить пост. Подробности можно посмотреть в логах.")
-
+    
     # try:
     #     await send_random_post_job(route_id)
     #     await message.answer("Готово! Проверь целевой чат :)")
@@ -700,11 +695,13 @@ def is_missing_source_message_error(error: Exception) -> bool:
     return any(marker in error_str for marker in SOURCE_MESSAGE_MISSING_ERRORS)
 
 
-async def send_random_post_job(route_id: int, _attempt: int = 0) -> bool:
+async def send_random_post_job(route_id: int, _attempt: int = 0, manual_send: bool = False) -> bool:
     """
     Задача планировщика для конкретного маршрута.
     При удалённом посте автоматически пытается отправить следующий.
     Максимум 5 попыток, чтобы избежать бесконечного цикла.
+    
+    manual_send=True - ручная отправка через /send_now, не обновляет расписание
     """
     MAX_ATTEMPTS = 5
 
@@ -720,22 +717,19 @@ async def send_random_post_job(route_id: int, _attempt: int = 0) -> bool:
         logging.warning(f"Маршрут {route_id} не найден. Пропускаю отправку.")
         return False
 
-    #logging.info(f"Сработка маршрута {route_id}. Ищем пост...")
-
     source_chat_id = route['source_chat_id'] or MAIN_SOURCE_CHAT_ID
     target_chat_id = route['target_chat_id']
     target_topic_id = route['target_topic_id'] or 0
     interval_seconds = route['interval_seconds'] or 0
 
     post = get_random_unsent_post(route_id)
-    
 
     # Если все посты из базы уже отправлены, сбрасываем флаги и берём заново
     if not post:
         logging.info("Все посты отправлены. Сбрасываем флаги для нового цикла")
         reset_posts_for_route(route_id)
         post = get_random_unsent_post(route_id)
-    
+
     if not post:
         logging.warning(f"В маршруте {route_id} вообще нет постов!")
         return False
@@ -744,10 +738,13 @@ async def send_random_post_job(route_id: int, _attempt: int = 0) -> bool:
     if not message_ids:
         logging.warning(f"Пост {post['id']} из маршрута {route_id} пустой. Удаляю.")
         delete_post_db(post['id'])
+        
+        # При ручной отправке не делаем рекурсию
+        if manual_send:
+            return False
+        
         # Рекурсивно пробуем следующий пост
-        return await send_random_post_job(route_id, _attempt + 1)
-
-    #logging.info(f"Отправляем сообщения: {message_ids}")
+        return await send_random_post_job(route_id, _attempt + 1, manual_send=manual_send)
 
     # Если указан целевой топик, добавляем message_thread_id
     send_kwargs = {}
@@ -774,20 +771,15 @@ async def send_random_post_job(route_id: int, _attempt: int = 0) -> bool:
 
         mark_post_sent(post['id'])
 
-        # logging.info(
-        #     f"Пост из {len(message_ids)} сообщений отправлен "
-        #     f"в чат {target_chat_id} (topic={target_topic_id or 'нет'})"
-        # )
-
-        # Сохраняем время следующего запуска
-        if interval_seconds > 0:
+        # Обновляем next_run_time ТОЛЬКО если это автоматическая отправка
+        if not manual_send and interval_seconds > 0:
             next_run = datetime.now() + timedelta(seconds=interval_seconds)
             update_next_run_time(route_id, next_run.isoformat())
             logging.info(
                 f"Пост отправлен. Следующий запуск маршрута {route_id}: {next_run}"
             )
         else:
-            logging.info(f"Пост отправлен (без интервала).")
+            logging.info(f"Пост отправлен (manual_send={manual_send}).")
 
         return True
 
@@ -799,13 +791,16 @@ async def send_random_post_job(route_id: int, _attempt: int = 0) -> bool:
             )
             delete_post_db(post['id'])
 
+            # При ручной отправке не делаем рекурсию
+            if manual_send:
+                return False
+
             # Пробуем следующий пост без ожидания
-            return await send_random_post_job(route_id, _attempt + 1)
+            return await send_random_post_job(route_id, _attempt + 1, manual_send=manual_send)
 
         # Остальные ошибки: сеть, лимиты, проблемы с целевым чатом и т.д.
         logging.error(f"Ошибка отправки маршрута {route_id}: {e}")
         return False
-
 
 
 def schedule_route_job(route):
