@@ -4,6 +4,10 @@ import asyncio
 import logging
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import Command
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -20,13 +24,20 @@ from db_funcs import (
     mark_post_sent,
     reset_posts_for_route,
     get_random_unsent_post,
-    delete_route_db
+    delete_route_db,
+    update_next_run_time
 )
 
 bot = Bot(token=API_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
+
+class AddRouteStates(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_time = State()
+    waiting_for_interval = State()
+    waiting_for_jitter = State()
 
 commands_router = Router()
 collector_router = Router()
@@ -46,6 +57,7 @@ media_group_timers = {}
 HELP_TEXT = (
     "Привет! Я бот для автоматической отправки постов по маршрутам.\n"
     "Используй команды ниже.\n\n"
+    "Все команды управления доступны только администратору.\n"
 
     "<b>Основные команды:</b>\n"
     "/start - приветствие\n"
@@ -58,6 +70,13 @@ HELP_TEXT = (
     "<code>/add_route &lt;ID топика&gt; &lt;ID чата&gt; &lt;ЧЧ:ММ&gt; &lt;интервал в секундах&gt;</code>\n"
     "или полный формат:\n"
     "<code>/add_route &lt;ID чата источника&gt; &lt;ID топика источника&gt; &lt;ID целевого чата&gt; &lt;ID целевого топика&gt; &lt;ЧЧ:ММ&gt; &lt;интервал в секундах&gt;</code>\n\n"
+
+    "<b>Пошаговое добавление маршрута:</b>\n"
+    "<code>/add_route &lt;исх_чат&gt; &lt;исх_топик&gt; &lt;цель_чат&gt; &lt;цель_топик&gt;</code>\n"
+    "После этого я отдельно спрошу название, время, интервал и разброс.\n\n"
+
+    "<b>Отмена пошагового добавления:</b>\n"
+    "/cancel\n\n"
 
     "Первый пост отправляется в указанное время, далее каждые &lt;интервал&gt; секунд.\n"
     "86400 сек = раз в сутки, 3600 = раз в час, 60 = раз в минуту\n\n"
@@ -86,42 +105,53 @@ async def cmd_start(message: types.Message):
 
 
 @commands_router.message(Command("add_route"), F.from_user.id == ADMIN_ID)
-async def cmd_add_route(message: types.Message):
+async def cmd_add_route(message: types.Message, state: FSMContext):
     assert message.text is not None
 
     args = message.text.split()
 
     help_text = (
         "Дорогой, используй один из форматов.\n\n"
-        "<b>Короткий формат:</b>\n"
-        "<code>/add_route &lt;ID топика&gt; &lt;ID чата&gt; &lt;ЧЧ:ММ&gt; &lt;интервал в секундах&gt;</code>\n\n"
-        "<b>Полный формат:</b>\n"
-        "<code>/add_route &lt;ID чата источника&gt; &lt;ID топика источника&gt; &lt;ID целевого чата&gt; &lt;ID целевого топика&gt; &lt;ЧЧ:ММ&gt; &lt;интервал в секундах&gt;</code>\n\n"
+        "<b>Пошаговый режим:</b>\n"
+        "<code>/add_route &lt;исх_чат&gt; &lt;исх_топик&gt; &lt;цель_чат&gt; &lt;цель_топик&gt;</code>\n"
+        "Затем я спрошу название, время, интервал и разброс.\n\n"
+        "<b>Однострочный режим:</b>\n"
+        "<code>/add_route &lt;исх_чат&gt; &lt;исх_топик&gt; &lt;цель_чат&gt; &lt;цель_топик&gt; &lt;ЧЧ:ММ&gt; &lt;интервал&gt; [разброс]</code>\n\n"
         "<b>Условия:</b>\n"
         "<code>0</code> вместо чата-источника — использовать MAIN_SOURCE_CHAT_ID\n"
         "<code>0</code> вместо топика-источника — брать весь чат\n"
         "<code>0</code> вместо целевого топика — отправлять без топика / в общий поток\n"
-        "Интервал в секундах: 86400 = раз в сутки, 3600 = раз в час, 60 = раз в минуту\n\n"
+        "Интервал в секундах: 86400 = раз в сутки, 3600 = раз в час, 60 = раз в минуту\n"
+        "Разброс — случайная задержка перед отправкой, чтобы посты не выходили ровно в одно и то же время.\n"
+        "Разброс должен быть меньше интервала.\n\n"
         "<b>Примеры:</b>\n"
-        "<code>/add_route 123 -100998877 15:30 86400</code>\n"
         "<code>/add_route 0 123 -100998877 0 15:30 3600</code>\n"
+        "<code>/add_route 0 123 -100998877 0 15:30 3600 300</code>\n"
         "<code>/add_route -100111222333 0 -100998877 45 18:20 60</code>"
     )
 
     try:
         if len(args) == 5:
-            # Короткий формат:
-            # /add_route <source_topic_id> <target_chat_id> <HH:MM> <interval_seconds>
-            source_chat_id = 0
-            source_topic_id = int(args[1])
-            target_chat_id = int(args[2])
-            target_topic_id = 0
-            send_time = args[3]
-            interval_seconds = int(args[4])
+            # Пошаговый режим: /add_route исх_чат исх_топик цель_чат цель_топик
+            source_chat_id = int(args[1])
+            source_topic_id = int(args[2])
+            target_chat_id = int(args[3])
+            target_topic_id = int(args[4])
 
-        elif len(args) == 7:
-            # Полный формат:
-            # /add_route <source_chat_id> <source_topic_id> <target_chat_id> <target_topic_id> <HH:MM> <interval_seconds>
+            await state.update_data(
+                source_chat_id=source_chat_id,
+                source_topic_id=source_topic_id,
+                target_chat_id=target_chat_id,
+                target_topic_id=target_topic_id
+            )
+            await state.set_state(AddRouteStates.waiting_for_name)
+
+            await message.answer(
+                "Отлично! Теперь отправь мне название для этого маршрута."
+            )
+
+        elif len(args) == 8 or len(args) == 7:
+            # Однострочный режим
             source_chat_id = int(args[1])
             source_topic_id = int(args[2])
             target_chat_id = int(args[3])
@@ -129,59 +159,180 @@ async def cmd_add_route(message: types.Message):
             send_time = args[5]
             interval_seconds = int(args[6])
 
+            if len(args) == 8:
+                jitter_seconds = int(args[7])
+            else:
+                jitter_seconds = 0
+
+            # Валидация времени
+            h, m = map(int, send_time.split(':'))
+            if not (0 <= h <= 23 and 0 <= m <= 59):
+                raise ValueError("Неверное время")
+
+            # Валидация интервала
+            if interval_seconds <= 0:
+                raise ValueError("Интервал должен быть больше нуля")
+
+            # Валидация разброса
+            if jitter_seconds < 0:
+                raise ValueError("Разброс не может быть отрицательным")
+
+            if jitter_seconds >= interval_seconds:
+                raise ValueError("Разброс должен быть меньше интервала")
+
+            route_name = f"Маршрут {source_topic_id} -> {target_chat_id}"
+
+            route_id = add_route_db(
+                source_chat_id=source_chat_id,
+                source_topic_id=source_topic_id,
+                target_chat_id=target_chat_id,
+                target_topic_id=target_topic_id,
+                send_time=send_time,
+                interval_seconds=interval_seconds,
+                route_name=route_name,
+                jitter_seconds=jitter_seconds
+            )
+
+            route = get_route_by_id(route_id)
+            schedule_route_job(route)
+
+            # Формируем описание
+            effective_source_chat = source_chat_id or MAIN_SOURCE_CHAT_ID
+            if source_topic_id == 0:
+                source_description = f"чат <code>{effective_source_chat}</code> (весь чат)"
+            else:
+                source_description = f"чат <code>{effective_source_chat}</code>, топик <code>{source_topic_id}</code>"
+
+            if target_topic_id == 0:
+                target_description = f"чат <code>{target_chat_id}</code>"
+            else:
+                target_description = f"чат <code>{target_chat_id}</code>, топик <code>{target_topic_id}</code>"
+
+            jitter_text = f", разброс {jitter_seconds} сек." if jitter_seconds > 0 else ""
+
+            await message.answer(
+                f"Я добавила маршрут {route_id}!\n"
+                f"Название: {route_name}\n"
+                f"Источник: {source_description}\n"
+                f"Цель: {target_description}\n"
+                f"Первый пост в {send_time}, далее каждые {interval_seconds} сек.{jitter_text}",
+                parse_mode="HTML"
+            )
         else:
             await message.answer(help_text, parse_mode="HTML")
             return
 
-        # Валидация времени
-        h, m = map(int, send_time.split(':'))
-        if not (0 <= h <= 23 and 0 <= m <= 59):
-            raise ValueError("Неверное время")
-
-        # Валидация интервала
-        if interval_seconds <= 0:
-            raise ValueError("Интервал должен быть больше нуля")
-
-        route_id = add_route_db(
-            source_chat_id=source_chat_id,
-            source_topic_id=source_topic_id,
-            target_chat_id=target_chat_id,
-            target_topic_id=target_topic_id,
-            send_time=send_time,
-            interval_seconds=interval_seconds
-        )
-
-        # Регистрируем задачу в планировщике
-        schedule_route_job(route_id, send_time, interval_seconds)
-
-        effective_source_chat = source_chat_id or MAIN_SOURCE_CHAT_ID
-
-        if source_topic_id == 0:
-            source_description = f"чат <code>{effective_source_chat}</code> (весь чат)"
-        else:
-            source_description = f"чат <code>{effective_source_chat}</code>, топик <code>{source_topic_id}</code>"
-
-        if target_topic_id == 0:
-            target_description = f"чат <code>{target_chat_id}</code>"
-        else:
-            target_description = f"чат <code>{target_chat_id}</code>, топик <code>{target_topic_id}</code>"
-
-        await message.answer(
-            f"Я добавила маршрут {route_id}!\n"
-            f"Источник: {source_description}\n"
-            f"Цель: {target_description}\n"
-            f"Первый пост в {send_time}, далее каждые {interval_seconds} сек. "
-            f"Всё как ты сказал :)",
-            parse_mode="HTML"
-        )
-
     except Exception as e:
-        # Экранируем сообщение об ошибке для безопасного отображения
         error_text = str(e).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         await message.answer(
             f"Дорогой, ты, кажется, ошибся: {error_text}\n\n{help_text}",
             parse_mode="HTML"
         )
+
+
+@commands_router.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Действие отменено.")
+
+
+@commands_router.message(AddRouteStates.waiting_for_name, F.from_user.id == ADMIN_ID)
+async def route_step_name(message: types.Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Название маршрута нужно прислать обычным текстом.")
+        return
+    
+    route_name = message.text
+
+    await state.update_data(route_name=route_name)
+    await state.set_state(AddRouteStates.waiting_for_time)
+
+    await message.answer(f"Название сохранено: {route_name}\nТеперь отправь время первой отправки в формате ЧЧ:ММ")
+
+
+@commands_router.message(AddRouteStates.waiting_for_time, F.from_user.id == ADMIN_ID)
+async def route_step_time(message: types.Message, state: FSMContext):
+    send_time = message.text
+    try:
+        h, m = map(int, send_time.split(':')) # type: ignore
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+    except ValueError:
+        await message.answer("Неверный формат времени. Используй ЧЧ:ММ, например 15:30")
+        return
+
+    await state.update_data(send_time=send_time)
+    await state.set_state(AddRouteStates.waiting_for_interval)
+    await message.answer("Время сохранено. Теперь отправь интервал в секундах между постами")
+
+
+@commands_router.message(AddRouteStates.waiting_for_interval, F.from_user.id == ADMIN_ID)
+async def route_step_interval(message: types.Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Интервал нужно прислать числом в секундах.")
+        return
+    
+    try:
+        interval_seconds = int(message.text) # type: ignore
+        if interval_seconds <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Интервал должен быть положительным числом")
+        return
+
+    await state.update_data(interval_seconds=interval_seconds)
+    await state.set_state(AddRouteStates.waiting_for_jitter)
+    await message.answer("Интервал сохранён. Теперь отправь разброс в секундах (0 если не нужен)")
+
+
+@commands_router.message(AddRouteStates.waiting_for_jitter, F.from_user.id == ADMIN_ID)
+async def route_step_jitter(message: types.Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Разброс нужно прислать числом в секундах.")
+        return
+    
+    try:
+        jitter_seconds = int(message.text) # type: ignore
+        if jitter_seconds < 0:
+            raise ValueError
+        
+    except ValueError:
+        await message.answer("Разброс должен быть неотрицательным числом")
+        return
+
+    data = await state.get_data()
+    interval_seconds = data['interval_seconds']
+
+    if jitter_seconds >= interval_seconds:
+        await message.answer(
+            f"Разброс ({jitter_seconds} сек.) должен быть меньше интервала ({interval_seconds} сек.).\nПопробуй ещё раз"
+        )
+        return
+
+    # Все данные собраны, создаём маршрут
+    route_id = add_route_db(
+        source_chat_id=data['source_chat_id'],
+        source_topic_id=data['source_topic_id'],
+        target_chat_id=data['target_chat_id'],
+        target_topic_id=data['target_topic_id'],
+        send_time=data['send_time'],
+        interval_seconds=interval_seconds,
+        route_name=data['route_name'],
+        jitter_seconds=jitter_seconds
+    )
+
+    route = get_route_by_id(route_id)
+    schedule_route_job(route)
+
+    await state.clear()
+
+    jitter_text = f", разброс {jitter_seconds} сек." if jitter_seconds > 0 else ""
+
+    await message.answer(
+        f"Маршрут {route_id} успешно создан!\n"
+        f"Название: {data['route_name']}\n"
+        f"Первый пост в {data['send_time']}, далее каждые {interval_seconds} сек.{jitter_text}"
+    )
 
 
 @commands_router.message(Command("routes"), F.from_user.id == ADMIN_ID)
@@ -200,22 +351,27 @@ async def cmd_list_routes(message: types.Message):
         target_chat_id = r['target_chat_id']
         target_topic_id = r['target_topic_id'] or 0
         interval_seconds = r['interval_seconds']
+        route_name = r['route_name'] or f"Маршрут {r['id']}"
+        jitter_seconds = r['jitter_seconds'] or 0
 
         if source_topic_id == 0:
-            source_text = f"чат `{source_chat_id}` (весь чат)"
+            source_text = f"чат <code>{source_chat_id}</code> (весь чат)"
         else:
-            source_text = f"чат `{source_chat_id}`, топик `{source_topic_id}`"
+            source_text = f"чат <code>{source_chat_id}</code>, топик <code>{source_topic_id}</code>"
 
         if target_topic_id == 0:
-            target_text = f"чат `{target_chat_id}`"
+            target_text = f"чат <code>{target_chat_id}</code>"
         else:
-            target_text = f"чат `{target_chat_id}`, топик `{target_topic_id}`"
+            target_text = f"чат <code>{target_chat_id}</code>, топик <code>{target_topic_id}</code>"
+
+        jitter_text = f", разброс {jitter_seconds} сек." if jitter_seconds > 0 else ""
+
 
         text += (
-            f"ID <code>{r['id']}</code>:\n"
+            f"ID <code>{r['id']}</code>: {route_name}\n"
             f"Источник: {source_text}\n"
             f"Цель: {target_text}\n"
-            f"Первый пост в {r['send_time']}, далее каждые {interval_seconds} сек.\n\n"
+            f"Первый пост в {r['send_time']}, далее каждые {interval_seconds} сек.{jitter_text}\n\n"
         )
 
     await message.answer(text, parse_mode="HTML")
@@ -258,6 +414,11 @@ async def cmd_send_now(message: types.Message):
     sent = await send_random_post_job(route_id)
 
     if sent:
+        # Пересоздаём задачу, чтобы планировщик учитывал новый next_run_time
+        updated_route = get_route_by_id(route_id)
+        if updated_route:
+            schedule_route_job(updated_route)
+
         await message.answer("Готово! Проверь целевой чат :)")
     else:
         await message.answer("Не получилось отправить пост. Подробности можно посмотреть в логах.")
@@ -312,24 +473,9 @@ async def cmd_delete_route(message: types.Message):
     deleted = delete_route_db(route_id)
 
     if deleted:
-        source_chat_id = route['source_chat_id'] or MAIN_SOURCE_CHAT_ID
-        source_topic_id = route['source_topic_id'] or 0
-        target_chat_id = route['target_chat_id']
-        target_topic_id = route['target_topic_id'] or 0
-
-        if source_topic_id == 0:
-            source_text = f"чат `{source_chat_id}` (весь чат)"
-        else:
-            source_text = f"чат `{source_chat_id}`, топик `{source_topic_id}`"
-
-        if target_topic_id == 0:
-            target_text = f"чат `{target_chat_id}`"
-        else:
-            target_text = f"чат `{target_chat_id}`, топик `{target_topic_id}`"
-
+        route_name = route['route_name'] or f"Маршрут {route_id}"
         await message.answer(
-            f"Ура, я удалила маршрут {route_id}!\n"
-            f"{source_text} -> {target_text}",
+            f"Ура, я удалила маршрут {route_id} ({route_name})!",
             parse_mode="HTML"
         )
     else:
@@ -353,7 +499,7 @@ async def cmd_import_message(message: types.Message):
     if len(args) != 3:
         await message.answer(
             "Дорогой, используй формат:\n"
-            "<code>/import_message <ID_маршрута> <ID_сообщения></code>\n\n"
+            "<code>/import_message &lt;ID_маршрута&lt; &lt;ID_сообщения&lt;</code>\n\n"
             "Пример:\n"
             "<code>/import_message 1 456</code>",
             parse_mode="HTML"
@@ -403,7 +549,7 @@ async def cmd_import_message(message: types.Message):
         )
     else:
         await message.answer(
-            f"Похоже, сообщение </code>{message_id}<code> уже было импортировано в маршрут <code>{route_id}</code>.",
+            f"Похоже, сообщение <code>{message_id}</code> уже было импортировано в маршрут <code>{route_id}</code>.",
             parse_mode="HTML"
         )
     
@@ -453,7 +599,7 @@ async def cmd_import_range(message: types.Message):
     if len(args) != 4:
         await message.answer(
             "Дорогой, используй формат:\n"
-            "<code>/import_range <ID_маршрута> <начальный_ID> <конечный_ID></code>\n\n"
+            "<code>/import_range &lt;ID_маршрута&lt; &lt;начальный_ID&lt; &lt;конечный_ID&lt;</code>\n\n"
             "Пример:\n"
             "<code>/import_range 1 100 150</code>",
             parse_mode="HTML"
@@ -528,18 +674,19 @@ async def cmd_import_range(message: types.Message):
 
 # ЛОГИКА БОТА
 
-async def send_random_post_job(route_id: int):
+async def send_random_post_job(route_id: int) -> bool:
     # задача планировщика для конкретного маршрута
     route = get_route_by_id(route_id)
     if not route:
         logging.warning(f"Маршрут {route_id} не найден. Пропускаю отправку.")
-        return
+        return False
 
-    logging.info(f"Сработка маршрута {route_id}. Ищем пост...")
+    #logging.info(f"Сработка маршрута {route_id}. Ищем пост...")
 
     source_chat_id = route['source_chat_id'] or MAIN_SOURCE_CHAT_ID
     target_chat_id = route['target_chat_id']
     target_topic_id = route['target_topic_id'] or 0
+    interval_seconds = route['interval_seconds'] or 0
 
     post = get_random_unsent_post(route_id)
     
@@ -552,14 +699,14 @@ async def send_random_post_job(route_id: int):
     
     if not post:
         logging.warning(f"В маршруте {route_id} вообще нет постов!")
-        return
+        return False
 
     message_ids = sorted(post['message_ids'])
     if not message_ids:
         logging.warning(f"Пост {post['id']} из маршрута {route_id} пустой.")
         return False
 
-    logging.info(f"Отправляем сообщения: {message_ids}")
+    #logging.info(f"Отправляем сообщения: {message_ids}")
 
     # Если указан целевой топик, добавляем message_thread_id
     send_kwargs = {}
@@ -583,47 +730,102 @@ async def send_random_post_job(route_id: int):
                     message_id=message_id,
                     **send_kwargs
                 )
+
         mark_post_sent(post['id'])
-        logging.info(
-            f"Пост из {len(message_ids)} сообщений отправлен "
-            f"в чат {target_chat_id} (topic={target_topic_id or 'нет'})"
-        )
+
+        # logging.info(
+        #     f"Пост из {len(message_ids)} сообщений отправлен "
+        #     f"в чат {target_chat_id} (topic={target_topic_id or 'нет'})"
+        # )
+
+        # Сохраняем время следующего запуска
+        if interval_seconds > 0:
+            next_run = datetime.now() + timedelta(seconds=interval_seconds)
+            update_next_run_time(route_id, next_run.isoformat())
+            logging.info(
+                f"Пост отправлен. Следующий запуск маршрута {route_id}: {next_run}"
+            )
+        else:
+            logging.info(f"Пост отправлен (без интервала).")
+
         return True
 
     except Exception as e:
         logging.error(f"Ошибка отправки: {e}")
         return False
 
-def schedule_route_job(route_id, send_time, interval_seconds):
+
+
+def schedule_route_job(route):
     """
     Регистрирует задачу в планировщике.
-    Первый запуск происходит в send_time, затем каждые interval_seconds секунд.
+    Использует сохранённый next_run_time из БД, чтобы не сбрасывать
+    расписание после перезапуска бота.
     """
-    h, m = map(int, send_time.split(':'))
 
-    # Вычисляем ближайший момент времени ЧЧ:ММ
-    now = datetime.now()
-    start_date = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    route_id = route['id']
+    job_id = f"route_{route_id}"
+    interval_seconds = route['interval_seconds'] or 0
+    send_time = route['send_time']
+    saved_next_run = route['next_run_time']
+    jitter_seconds = route['jitter_seconds'] or 0
 
-    # Если это время уже прошло сегодня, переносим на завтра
-    if start_date <= now:
-        start_date += timedelta(days=1)
+    if not interval_seconds or not send_time:
+        logging.warning(f"Маршрут {route_id}: нет интервала или времени отправки")
+        return
+
+    # Определяем start_date
+    if saved_next_run:
+        # Используем сохранённое время следующего запуска
+        try:
+            start_date = datetime.fromisoformat(saved_next_run)
+            logging.info(
+                f"Маршрут {route_id}: восстановлен next_run_time = {start_date}"
+            )
+        except ValueError:
+            logging.warning(
+                f"Маршрут {route_id}: невалидный next_run_time '{saved_next_run}', "
+                f"пересчитываю"
+            )
+            start_date = _calculate_initial_start(send_time)
+
+    else:
+        # Первый запуск — вычисляем начальное время
+        start_date = _calculate_initial_start(send_time)
+        logging.info(
+            f"Маршрут {route_id}: первый запуск, start_date = {start_date}"
+        )
 
     scheduler.add_job(
         send_random_post_job,
         trigger='interval',
         seconds=interval_seconds,
         start_date=start_date,
-        #jitter=3600,
+        jitter=jitter_seconds if jitter_seconds > 0 else None,
         args=[route_id],
-        id=f"route_{route_id}",
-        replace_existing=True
+        id=job_id,
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True
     )
 
     logging.info(
-        f"Загружен маршрут {route_id}: старт в {send_time}, "
-        f"далее каждые {interval_seconds} сек."
+        f"Загружен маршрут {route_id}: "
+        f"старт {start_date}, далее каждые {interval_seconds} сек."
+        + (f", разброс {jitter_seconds} сек." if jitter_seconds > 0 else "")
     )
+
+
+
+def _calculate_initial_start(send_time: str) -> datetime:
+    """Вычисляет ближайший момент ЧЧ:ММ от текущего времени."""
+    h, m = map(int, send_time.split(':'))
+    now = datetime.now()
+    start_date = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if start_date <= now:
+        start_date += timedelta(days=1)
+    return start_date
+
 
 
 @collector_router.message()
@@ -698,6 +900,8 @@ async def collect_post(message: types.Message):
                 f"Пост {message.message_id} сохранён для маршрута {route['id']}"
             )
 
+
+
 async def set_bot_commands():
     await bot.set_my_commands(
         [
@@ -711,7 +915,9 @@ async def set_bot_commands():
             types.BotCommand(command="import_range", description="Импортировать диапазон сообщений"),
         ]
     )
-    
+
+
+
 # LAUNCH
 async def main():
     init_db()
@@ -722,7 +928,7 @@ async def main():
     routes = get_all_routes()
 
     for r in routes:
-        schedule_route_job(r['id'], r['send_time'], r['interval_seconds'])
+        schedule_route_job(r)
     
     scheduler.start()
     logging.info("Бот запущен и слушает топики...")

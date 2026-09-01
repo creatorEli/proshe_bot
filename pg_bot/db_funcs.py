@@ -8,7 +8,8 @@ from config import DB_NAME, MAIN_SOURCE_CHAT_ID
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Формируем полный путь к файлу бд
 # DB_PATH = os.path.join(BASE_DIR, DB_NAME)
-DB_PATH = "./../data/bot_scalable.db"# + DB_NAME
+DB_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "data", "bot_scalable.db"))
+
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -21,7 +22,10 @@ def init_db():
                  target_chat_id INTEGER,
                  target_topic_id INTEGER DEFAULT 0,
                  send_time TEXT,
-                 interval_seconds INTEGER DEFAULT 86400
+                 next_run_time TEXT DEFAULT NULL,
+                 interval_seconds INTEGER DEFAULT 86400,
+                 route_name TEXT DEFAULT NULL,
+                 jitter_seconds INTEGER DEFAULT 0
              )''')
 
 
@@ -37,7 +41,16 @@ def init_db():
 
     if 'interval_seconds' not in route_columns:
         c.execute('ALTER TABLE routes ADD COLUMN interval_seconds INTEGER DEFAULT 86400')
-    
+
+    if 'next_run_time' not in route_columns:
+        c.execute('ALTER TABLE routes ADD COLUMN next_run_time TEXT DEFAULT NULL')
+
+    if 'route_name' not in route_columns:
+        c.execute('ALTER TABLE routes ADD COLUMN route_name TEXT DEFAULT NULL')
+
+    if 'jitter_seconds' not in route_columns:
+        c.execute('ALTER TABLE routes ADD COLUMN jitter_seconds INTEGER DEFAULT 0')
+
     # Таблица постов: один пост может содержать несколько message_id,
     # например галерею. Храним список как JSON.
     c.execute('''CREATE TABLE IF NOT EXISTS posts (
@@ -52,23 +65,29 @@ def init_db():
 
     # Миграция старой таблицы posts, если там был message_id вместо message_ids
     try:
-        c.execute('SELECT message_id FROM posts LIMIT 1')
-        c.execute('SELECT id, route_id, message_id FROM posts')
-        old_posts = c.fetchall()
+        # Миграция старой таблицы posts, если там был message_id вместо message_ids
+        c.execute('PRAGMA table_info(posts)')
+        post_columns = {row[1] for row in c.fetchall()}
 
-        if old_posts:
+        if 'message_id' in post_columns and 'message_ids' not in post_columns:
+            old_posts = c.execute('SELECT id, route_id, message_id FROM posts').fetchall()
+
             c.execute('DROP TABLE posts')
 
-            c.execute('''CREATE TABLE posts
-                         (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                          route_id INTEGER,
-                          message_ids TEXT,
-                          is_sent INTEGER DEFAULT 0,
-                          FOREIGN KEY(route_id) REFERENCES routes(id))''')
-            
+            c.execute('''CREATE TABLE posts (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            route_id INTEGER,
+                            message_ids TEXT,
+                            is_sent INTEGER DEFAULT 0,
+                            FOREIGN KEY(route_id) REFERENCES routes(id)
+                        )''')
+
             for _, route_id, message_id in old_posts:
-                c.execute('INSERT INTO posts (route_id, message_ids, is_sent) VALUES (?, ?, 0)',
-                         (route_id, json.dumps([message_id])))
+                c.execute(
+                    'INSERT INTO posts (route_id, message_ids, is_sent) VALUES (?, ?, 0)',
+                    (route_id, json.dumps([message_id]))
+                )
+
             conn.commit()
 
     except sqlite3.OperationalError:
@@ -79,33 +98,37 @@ def init_db():
     conn.close()
 
 
-def add_route_db(source_chat_id, source_topic_id, target_chat_id, target_topic_id, send_time=None, interval_seconds=0):
+def add_route_db(source_chat_id, source_topic_id, target_chat_id, target_topic_id,
+                 send_time=None, interval_seconds=0, route_name=None, jitter_seconds=0):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-
     send_time = send_time or None
     interval_seconds = int(interval_seconds or 0)
+    jitter_seconds = int(jitter_seconds or 0)
+    route_name = route_name or None
 
     c.execute(
         '''INSERT INTO routes
            (source_chat_id, source_topic_id, target_chat_id, target_topic_id,
-            send_time, interval_seconds)
-           VALUES (?, ?, ?, ?, ?, ?)''',
+            send_time, interval_seconds, route_name, jitter_seconds)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
         (
             source_chat_id or 0,
             source_topic_id or 0,
             target_chat_id,
             target_topic_id or 0,
             send_time,
-            interval_seconds
+            interval_seconds,
+            route_name,
+            jitter_seconds
         )
     )
 
     conn.commit()
     route_id = c.lastrowid
     conn.close()
-
     return route_id
+
 
 def get_all_routes():
     conn = sqlite3.connect(DB_PATH)
@@ -265,3 +288,13 @@ def delete_route_db(route_id):
         return deleted > 0
     finally:
         conn.close()
+
+def update_next_run_time(route_id: int, next_run_time_iso: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        'UPDATE routes SET next_run_time = ? WHERE id = ?',
+        (next_run_time_iso, route_id)
+    )
+    conn.commit()
+    conn.close()
