@@ -25,7 +25,8 @@ from db_funcs import (
     reset_posts_for_route,
     get_random_unsent_post,
     delete_route_db,
-    update_next_run_time
+    update_next_run_time,
+    delete_post_db
 )
 
 bot = Bot(token=API_TOKEN)
@@ -674,8 +675,46 @@ async def cmd_import_range(message: types.Message):
 
 # ЛОГИКА БОТА
 
-async def send_random_post_job(route_id: int) -> bool:
-    # задача планировщика для конкретного маршрута
+SOURCE_MESSAGE_MISSING_ERRORS = (
+    'message to copy not found',
+    'messages to copy not found',
+    'message not found',
+    'message to forward not found',
+    'there are no messages to forward',
+    'message_id_invalid',
+    'wrong message id',
+    'invalid message id',
+    "message can't be copied",
+    'was not forwarded',           # ДЛЯ УДАЛЁННОЙ ГАЛЕРЕИ, 
+    # НО МОЖЕТ ВЫЗВАТЬ УДАЛЕНИЕ ВСЕХ СООБЩЕНИЙ ЕСЛИ ПРОБЕЛМА В ЧАТАХ!!!
+    'failed to send message',
+)
+
+
+def is_missing_source_message_error(error: Exception) -> bool:
+    """
+    Проверяет, что ошибка связана с отсутствием/недоступностью
+    исходного сообщения или галереи в чате-источнике.
+    """
+    error_str = str(error).lower()
+    return any(marker in error_str for marker in SOURCE_MESSAGE_MISSING_ERRORS)
+
+
+async def send_random_post_job(route_id: int, _attempt: int = 0) -> bool:
+    """
+    Задача планировщика для конкретного маршрута.
+    При удалённом посте автоматически пытается отправить следующий.
+    Максимум 5 попыток, чтобы избежать бесконечного цикла.
+    """
+    MAX_ATTEMPTS = 5
+
+    if _attempt >= MAX_ATTEMPTS:
+        logging.warning(
+            f"Маршрут {route_id}: достигнуто макс. число попыток ({MAX_ATTEMPTS}). "
+            f"Все доступные посты, вероятно, удалены."
+        )
+        return False
+
     route = get_route_by_id(route_id)
     if not route:
         logging.warning(f"Маршрут {route_id} не найден. Пропускаю отправку.")
@@ -703,8 +742,10 @@ async def send_random_post_job(route_id: int) -> bool:
 
     message_ids = sorted(post['message_ids'])
     if not message_ids:
-        logging.warning(f"Пост {post['id']} из маршрута {route_id} пустой.")
-        return False
+        logging.warning(f"Пост {post['id']} из маршрута {route_id} пустой. Удаляю.")
+        delete_post_db(post['id'])
+        # Рекурсивно пробуем следующий пост
+        return await send_random_post_job(route_id, _attempt + 1)
 
     #logging.info(f"Отправляем сообщения: {message_ids}")
 
@@ -751,7 +792,18 @@ async def send_random_post_job(route_id: int) -> bool:
         return True
 
     except Exception as e:
-        logging.error(f"Ошибка отправки: {e}")
+        if is_missing_source_message_error(e):
+            logging.warning(
+                f"Пост {post['id']} недоступен в источнике. Удаляю и пробую следующий. "
+                f"(попытка {_attempt + 1}/{MAX_ATTEMPTS})"
+            )
+            delete_post_db(post['id'])
+
+            # Пробуем следующий пост без ожидания
+            return await send_random_post_job(route_id, _attempt + 1)
+
+        # Остальные ошибки: сеть, лимиты, проблемы с целевым чатом и т.д.
+        logging.error(f"Ошибка отправки маршрута {route_id}: {e}")
         return False
 
 

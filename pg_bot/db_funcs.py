@@ -298,3 +298,10 @@ def update_next_run_time(route_id: int, next_run_time_iso: str):
     )
     conn.commit()
     conn.close()
+
+def delete_post_db(post_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('DELETE FROM posts WHERE id = ?', (post_id,))
+    conn.commit()
+    conn.close()
