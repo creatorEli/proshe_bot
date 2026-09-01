@@ -7,11 +7,10 @@ from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from collections import defaultdict
 from datetime import datetime, timedelta
-
+from zoneinfo import ZoneInfo
 from config import ADMIN_ID, API_TOKEN, MAIN_SOURCE_CHAT_ID, TIMEZONE
 
 from db_funcs import (
@@ -773,10 +772,11 @@ async def send_random_post_job(route_id: int, _attempt: int = 0, manual_send: bo
 
         # Обновляем next_run_time ТОЛЬКО если это автоматическая отправка
         if not manual_send and interval_seconds > 0:
-            next_run = datetime.now() + timedelta(seconds=interval_seconds)
+            tz = ZoneInfo(TIMEZONE)
+            next_run = datetime.now(tz) + timedelta(seconds=interval_seconds)
             update_next_run_time(route_id, next_run.isoformat())
             logging.info(
-                f"Пост отправлен. Следующий запуск маршрута {route_id}: {next_run}"
+                f"Пост отправ   лен. Следующий запуск маршрута {route_id}: {next_run}"
             )
         else:
             logging.info(f"Пост отправлен (manual_send={manual_send}).")
@@ -867,7 +867,8 @@ def schedule_route_job(route):
 def _calculate_initial_start(send_time: str) -> datetime:
     """Вычисляет ближайший момент ЧЧ:ММ от текущего времени."""
     h, m = map(int, send_time.split(':'))
-    now = datetime.now()
+    tz = ZoneInfo(TIMEZONE)
+    now = datetime.now(tz)
     start_date = now.replace(hour=h, minute=m, second=0, microsecond=0)
     if start_date <= now:
         start_date += timedelta(days=1)
