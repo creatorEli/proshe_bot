@@ -6,6 +6,9 @@ config~
 *.sqlite
 *.sqlite3
 
+# Старый код
+prev/
+
 # Python
 __pycache__/
 *.py[cod]
