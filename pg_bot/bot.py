@@ -17,13 +17,15 @@ from config import ADMIN_ID, API_TOKEN, MAIN_SOURCE_CHAT_ID, TIMEZONE
 from db_funcs import (
     init_db,
     add_chat_topic, get_chat_topic_by_id, get_chat_topic_by_tg_ids,
+    get_chat_topic_by_name, get_all_chat_topics,
     add_route, get_route_by_id, get_all_routes, update_route_schedule,
     delete_route, skip_next_publication,
-    add_route_target, get_route_targets, get_note_for_target,
+    add_route_target, get_route_targets,
     save_post, mark_post_sent, reset_posts_for_route,
     get_random_unsent_post, delete_post,
     get_routes_for_source,
-    update_route,  # <-- новая функция для обновления маршрута
+    update_route, update_chat_topic, delete_chat_topic, check_chat_topic_in_use,
+    get_random_sendable_targets,   # <-- новая функция
 )
 
 bot = Bot(token=API_TOKEN)
@@ -58,34 +60,36 @@ media_group_timers = {}
 HELP_TEXT = (
     "Привет! Я бот для автоматической отправки постов по маршрутам.\n"
     "Используй команды ниже.\n\n"
-    "Все команды управления доступны только администратору.\n"
-    "<b>Основные команды:</b>\n"
-    "/start - приветствие\n"
-    "/help - эта справка\n"
-    "/routes - показать сохранённые маршруты (только админ)\n"
-    "/send_now &lt;ID маршрута&gt; - отправить пост из маршрута прямо сейчас (только админ)\n"
-    "/delete_route &lt;ID маршрута&gt; - удалить маршрут (только админ)\n\n"
-    "<b>Добавление маршрута:</b>\n"
-    "<code>/add_route &lt;исх_чат&gt; &lt;исх_топик&gt; &lt;цель_чат&gt; &lt;цель_топик&gt; &lt;ЧЧ:ММ&gt; &lt;интервалы ДД:ЧЧ:ММ:СС&gt;</code>\n"
-    "или пошагово:\n"
-    "<code>/add_route &lt;исх_чат&gt; &lt;исх_топик&gt; &lt;цель_чат&gt; &lt;цель_топик&gt;</code>\n"
-    "После этого я отдельно спрошу название, время, интервалы и разброс.\n\n"
-    "<b>Управление маршрутами:</b>\n"
-    "/freeze_route &lt;ID&gt; - заморозить маршрут (остановить публикации)\n"
-    "/unfreeze_route &lt;ID&gt; - разморозить маршрут (возобновить публикации)\n"
-    "/edit_time &lt;ID&gt; &lt;ЧЧ:ММ&gt; - изменить время первой отправки\n"
-    "/edit_intervals &lt;ID&gt; &lt;интервалы&gt; - изменить интервалы (ДД:ЧЧ:ММ:СС через запятую)\n"
-    "/edit_jitter &lt;ID&gt; &lt;секунды&gt; - изменить разброс в секундах\n\n"
+    "Все команды управления доступны только администратору.\n\n"
+    "<b>📚 Управление чатами/топиками:</b>\n"
+    "<code>/add_chat &lt;имя&gt; &lt;tg_chat_id&gt; [tg_topic_id]</code> — зарегистрировать чат/топик\n"
+    "<code>/chats</code> — список всех зарегистрированных чатов\n"
+    "<code>/rename_chat &lt;id&gt; &lt;новое_имя&gt;</code> — переименовать\n"
+    "<code>/freeze_chat &lt;id&gt;</code> — заморозить чат (отключить)\n"
+    "<code>/unfreeze_chat &lt;id&gt;</code> — разморозить чат\n"
+    "<code>/toggle_sendable &lt;id&gt;</code> — переключить флаг «можно отправлять» (для целей)\n"
+    "<code>/delete_chat &lt;id&gt;</code> — удалить чат (если не используется)\n\n"
+    "<b>🛣️ Управление маршрутами:</b>\n"
+    "<code>/routes</code> — список маршрутов\n"
+    "<code>/add_route &lt;имя_исх&gt; &lt;имя_цели&gt;</code> — пошаговое добавление\n"
+    "<code>/add_route &lt;имя_исх&gt; &lt;имя_цели&gt; &lt;ЧЧ:ММ&gt; &lt;интервалы&gt;</code> — однострочное\n"
+    "<code>/send_now &lt;ID&gt;</code> — отправить пост сейчас\n"
+    "<code>/delete_route &lt;ID&gt;</code> — удалить маршрут\n"
+    "<code>/freeze_route &lt;ID&gt;</code> — заморозить маршрут\n"
+    "<code>/unfreeze_route &lt;ID&gt;</code> — разморозить маршрут\n"
+    "<code>/edit_time &lt;ID&gt; &lt;ЧЧ:ММ&gt;</code> — изменить время\n"
+    "<code>/edit_intervals &lt;ID&gt; &lt;интервалы&gt;</code> — изменить интервалы\n"
+    "<code>/edit_jitter &lt;ID&gt; &lt;секунды&gt;</code> — изменить разброс\n"
+    "<code>/skip_next &lt;ID&gt;</code> — пропустить ближайшую публикацию\n\n"
+    "<code>/toggle_random &lt;ID&gt</code> — вкл/выкл случайную рассылку по sendable-чатaм (для источника)\n"
+    "<b>📥 Импорт сообщений:</b>\n"
+    "<code>/import_message &lt;ID маршрута&gt; &lt;ID сообщения&gt;</code>\n"
+    "<code>/import_range &lt;ID маршрута&gt; &lt;начальный ID&gt; &lt;конечный ID&gt;</code>\n\n"
     "<b>Отмена:</b> /cancel\n\n"
-    "<b>Условия:</b>\n"
-    "<code>0</code> вместо чата источника - использовать основной чат из конфига\n"
-    "<code>0</code> вместо топика источника - брать весь чат целиком\n"
-    "<code>0</code> вместо целевого топика - отправлять в общий поток (без топика)\n\n"
-    "<b>Импорт сообщений:</b>\n"
-    "/import_message &lt;ID маршрута&gt; &lt;ID сообщения&gt;\n"
-    "/import_range &lt;ID маршрута&gt; &lt;начальный ID&gt; &lt;конечный ID&gt;\n\n"
-    "<b>Пропуск:</b>\n"
-    "/skip_next &lt;ID маршрута&gt; - пропустить ближайшую публикацию\n"
+    "<b>💡 Подсказки:</b>\n"
+    "Имена чатов должны быть уникальными\n"
+    "<code>0</code> вместо tg_topic_id — общий поток (без топика)\n"
+    "Флаг «sendable» отмечает чаты, куда можно отправлять (для массовой рассылки)\n"
 )
 
 
@@ -126,20 +130,15 @@ def _recalculate_and_reschedule(route_id: int, route):
     """Пересчитывает next_run_time и обновляет задачу в планировщике."""
     intervals = json.loads(route['intervals_json'] or '[]')
     send_time = route['send_time']
-    
     if not intervals or not send_time:
         return
-    
     # Вычисляем новое время запуска
     start_date = _calculate_initial_start(send_time)
-    
     jitter = route['jitter_seconds'] or 0
     if jitter > 0:
         start_date += timedelta(seconds=random.randint(0, jitter))
-    
     # Обновляем расписание в БД
     update_route_schedule(route_id, 0, start_date.isoformat())
-    
     # Обновляем задачу в планировщике
     job_id = f"route_{route_id}"
     scheduler.add_job(
@@ -156,7 +155,271 @@ def _recalculate_and_reschedule(route_id: int, route):
 
 
 # ==========================================
-# КОМАНДЫ АДМИНА
+# КОМАНДЫ УПРАВЛЕНИЯ ЧАТАМИ
+# ==========================================
+
+@commands_router.message(Command("add_chat"), F.from_user.id == ADMIN_ID)
+async def cmd_add_chat(message: types.Message):
+    if not message.text:
+        return
+    args = message.text.split()
+
+    if len(args) < 3 or len(args) > 4:
+        await message.answer(
+            "<b>Формат:</b>\n"
+            "<code>/add_chat &lt;имя&gt; &lt;tg_chat_id&gt; [tg_topic_id]</code>\n\n"
+            "<b>Примеры:</b>\n"
+            "<code>/add_chat my_channel -1001234567890</code>\n"
+            "<code>/add_chat my_topic -1001234567890 42</code>\n\n"
+            "Имя — одно слово (без пробелов). Используйте <code>_</code> для разделения.\n"
+            "<code>0</code> вместо tg_topic_id — общий поток.",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        name = args[1]
+        tg_chat_id = _resolve_source_chat(int(args[2]))
+        tg_topic_id = int(args[3]) if len(args) == 4 else 0
+
+        # Проверяем уникальность имени
+        existing = get_chat_topic_by_name(name)
+        if existing:
+            await message.answer(
+                f"❌ Имя <code>{name}</code> уже занято чатом ID {existing['id']} "
+                f"({existing['ct_tg_chat_id']}:{existing['ct_tg_topic_id']}).\n"
+                f"Выбери другое имя или используй /rename_chat.",
+                parse_mode="HTML"
+            )
+            return
+
+        # Проверяем, нет ли уже такого чата/топика
+        existing_ct = get_chat_topic_by_tg_ids(tg_chat_id, tg_topic_id)
+        if existing_ct and existing_ct['ct_name']:
+            await message.answer(
+                f"⚠️ Чат <code>{tg_chat_id}:{tg_topic_id}</code> уже зарегистрирован "
+                f"под именем <code>{existing_ct['ct_name']}</code> (ID {existing_ct['id']}).\n"
+                f"Используй /rename_chat для переименования.",
+                parse_mode="HTML"
+            )
+            return
+
+        ct_id = add_chat_topic(
+            tg_chat_id, tg_topic_id,
+            name=name,
+            sendable=False,  # По умолчанию — не sendable
+        )
+
+        await message.answer(
+            f"✅ Чат зарегистрирован!\n"
+            f"ID: <code>{ct_id}</code>\n"
+            f"Имя: <code>{name}</code>\n"
+            f"TG: <code>{tg_chat_id}:{tg_topic_id}</code>\n"
+            f"Sendable: нет (переключи через /toggle_sendable, если нужно)",
+            parse_mode="HTML"
+        )
+    except ValueError as e:
+        await message.answer(f"Ошибка в числовых параметрах: {e}")
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+
+
+@commands_router.message(Command("chats"), F.from_user.id == ADMIN_ID)
+async def cmd_list_chats(message: types.Message):
+    chats = get_all_chat_topics(active_only=False)
+    if not chats:
+        await message.answer(
+            "Зарегистрированных чатов пока нет.\n"
+            "Добавь первый: <code>/add_chat &lt;имя&gt; &lt;chat_id&gt; [topic_id]</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    text = "<b>📚 Зарегистрированные чаты и топики:</b>\n\n"
+    for c in chats:
+        status = "✅" if c['is_active'] else "❄️"
+        sendable = "📤" if c['ct_sendable'] else "📥"
+        name = c['ct_name'] or "<i>без имени</i>"
+
+        usage = check_chat_topic_in_use(c['id'])
+        usage_parts = []
+        if usage['as_source']:
+            usage_parts.append(f"источник для {usage['as_source']}")
+        if usage['as_target']:
+            usage_parts.append(f"цель для {usage['as_target']}")
+        usage_text = ", ".join(usage_parts) if usage_parts else "не используется"
+
+        topic_text = f":{c['ct_tg_topic_id']}" if c['ct_tg_topic_id'] else ""
+
+        text += (
+            f"{status}{sendable} ID <code>{c['id']}</code>: <code>{name}</code>\n"
+            f"   TG: <code>{c['ct_tg_chat_id']}{topic_text}</code>\n"
+            f"   {usage_text}\n\n"
+        )
+
+    text += (
+        "<b>Легенда:</b>\n"
+        "✅ активен / ❄️ заморожен\n"
+        "📤 sendable (можно отправлять) / 📥 только источник"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+
+@commands_router.message(Command("rename_chat"), F.from_user.id == ADMIN_ID)
+async def cmd_rename_chat(message: types.Message):
+    if not message.text:
+        return
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer(
+            "Формат: <code>/rename_chat &lt;id&gt; &lt;новое_имя&gt;</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        ct_id = int(args[1])
+        new_name = args[2]
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+
+    # Проверяем, что чат существует
+    ct = get_chat_topic_by_id(ct_id)
+    if not ct:
+        await message.answer(f"Чат с ID {ct_id} не найден.")
+        return
+
+    # Проверяем уникальность нового имени
+    existing = get_chat_topic_by_name(new_name)
+    if existing and existing['id'] != ct_id:
+        await message.answer(
+            f"Имя <code>{new_name}</code> уже занято чатом ID {existing['id']}.",
+            parse_mode="HTML"
+        )
+        return
+
+    if update_chat_topic(ct_id, ct_name=new_name):
+        await message.answer(
+            f"✅ Чат {ct_id} переименован: <code>{new_name}</code>",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer("Не удалось переименовать.")
+
+
+@commands_router.message(Command("freeze_chat"), F.from_user.id == ADMIN_ID)
+async def cmd_freeze_chat(message: types.Message):
+    if not message.text:
+        return
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Формат: <code>/freeze_chat &lt;id&gt;</code>", parse_mode="HTML")
+        return
+    try:
+        ct_id = int(args[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+
+    ct = get_chat_topic_by_id(ct_id)
+    if not ct:
+        await message.answer(f"Чат {ct_id} не найден.")
+        return
+    if not ct['is_active']:
+        await message.answer(f"Чат {ct_id} уже заморожен.")
+        return
+
+    if update_chat_topic(ct_id, is_active=False):
+        name = ct['ct_name'] or f"чат {ct_id}"
+        await message.answer(f"❄️ Чат <code>{name}</code> (ID {ct_id}) заморожен.")
+    else:
+        await message.answer("Не удалось заморозить.")
+
+
+@commands_router.message(Command("unfreeze_chat"), F.from_user.id == ADMIN_ID)
+async def cmd_unfreeze_chat(message: types.Message):
+    if not message.text:
+        return
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Формат: <code>/unfreeze_chat &lt;id&gt;</code>", parse_mode="HTML")
+        return
+    try:
+        ct_id = int(args[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+
+    ct = get_chat_topic_by_id(ct_id)
+    if not ct:
+        await message.answer(f"Чат {ct_id} не найден.")
+        return
+    if ct['is_active']:
+        await message.answer(f"Чат {ct_id} уже активен.")
+        return
+
+    if update_chat_topic(ct_id, is_active=True):
+        name = ct['ct_name'] or f"чат {ct_id}"
+        await message.answer(f"✅ Чат <code>{name}</code> (ID {ct_id}) разморожен.")
+    else:
+        await message.answer("Не удалось разморозить.")
+
+
+@commands_router.message(Command("toggle_sendable"), F.from_user.id == ADMIN_ID)
+async def cmd_toggle_sendable(message: types.Message):
+    if not message.text:
+        return
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Формат: <code>/toggle_sendable &lt;id&gt;</code>", parse_mode="HTML")
+        return
+    try:
+        ct_id = int(args[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+
+    ct = get_chat_topic_by_id(ct_id)
+    if not ct:
+        await message.answer(f"Чат {ct_id} не найден.")
+        return
+
+    new_sendable = not bool(ct['ct_sendable'])
+    if update_chat_topic(ct_id, ct_sendable=new_sendable):
+        name = ct['ct_name'] or f"чат {ct_id}"
+        status = "📤 МОЖНО отправлять" if new_sendable else "📥 только источник"
+        await message.answer(
+            f"✅ Чат <code>{name}</code> (ID {ct_id}): {status}",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer("Не удалось переключить.")
+
+
+@commands_router.message(Command("delete_chat"), F.from_user.id == ADMIN_ID)
+async def cmd_delete_chat(message: types.Message):
+    if not message.text:
+        return
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Формат: <code>/delete_chat &lt;id&gt;</code>", parse_mode="HTML")
+        return
+    try:
+        ct_id = int(args[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+
+    success, msg = delete_chat_topic(ct_id)
+    if success:
+        await message.answer(f"✅ {msg}")
+    else:
+        await message.answer(f"❌ {msg}")
+
+
+# ==========================================
+# КОМАНДЫ МАРШРУТОВ 
 # ==========================================
 
 @commands_router.message(Command("help"), F.from_user.id == ADMIN_ID)
@@ -177,49 +440,61 @@ async def cmd_add_route(message: types.Message, state: FSMContext):
 
     help_text = (
         "<b>Однострочный режим:</b>\n"
-        "<code>/add_route &lt;исх_чат&gt; &lt;исх_топик&gt; &lt;цель_чат&gt; "
-        "&lt;цель_топик&gt; &lt;ЧЧ:ММ&gt; &lt;интервалы&gt;</code>\n\n"
+        "<code>/add_route &lt;имя_исх&gt; &lt;имя_цели&gt; &lt;ЧЧ:ММ&gt; &lt;интервалы&gt;</code>\n\n"
         "<b>Пошаговый режим:</b>\n"
-        "<code>/add_route &lt;исх_чат&gt; &lt;исх_топик&gt; &lt;цель_чат&gt; "
-        "&lt;цель_топик&gt;</code>\n"
-        "Затем я спрошу название, время, интервалы и разброс."
+        "<code>/add_route &lt;имя_исх&gt; &lt;имя_цели&gt;</code>\n"
+        "Затем я спрошу название, время, интервалы и разброс.\n\n"
+        "<b>💡 Имена чатов</b> — те, что ты зарегистрировал через /add_chat\n"
+        "Посмотри список: /chats"
     )
 
+    if len(args) not in (3, 5):
+        await message.answer(help_text, parse_mode="HTML")
+        return
+
     try:
-        if len(args) == 5:
+        source_name = args[1]
+        target_name = args[2]
+
+        # Ищем чаты по именам
+        source_ct = get_chat_topic_by_name(source_name)
+        if not source_ct:
+            await message.answer(
+                f"❌ Исходный чат <code>{source_name}</code> не найден.\n"
+                f"Зарегистрируй его через /add_chat или проверь список: /chats",
+                parse_mode="HTML"
+            )
+            return
+
+        target_ct = get_chat_topic_by_name(target_name)
+        if not target_ct:
+            await message.answer(
+                f"❌ Целевой чат <code>{target_name}</code> не найден.\n"
+                f"Зарегистрируй его через /add_chat или проверь список: /chats",
+                parse_mode="HTML"
+            )
+            return
+
+        if len(args) == 3:
             # ---- Пошаговый режим ----
-            src_chat = _resolve_source_chat(int(args[1]))
-            src_topic = int(args[2])
-            tgt_chat = int(args[3])
-            tgt_topic = int(args[4])
-
-            source_ct_id = add_chat_topic(
-                src_chat, src_topic,
-                name=f"Source {src_chat}:{src_topic}"
-            )
-            target_ct_id = add_chat_topic(
-                tgt_chat, tgt_topic,
-                name=f"Target {tgt_chat}:{tgt_topic}",
-                sendable=True
-            )
-
             await state.update_data(
-                source_ct_id=source_ct_id,
-                target_ct_id=target_ct_id,
-                src_chat=src_chat, src_topic=src_topic,
-                tgt_chat=tgt_chat, tgt_topic=tgt_topic,
+                source_ct_id=source_ct['id'],
+                target_ct_id=target_ct['id'],
+                source_name=source_name,
+                target_name=target_name,
             )
             await state.set_state(AddRouteStates.waiting_for_name)
-            await message.answer("Отлично! Чаты зарегистрированы. Теперь отправь название для этого маршрута.")
-
-        elif len(args) in (7, 8):
+            await message.answer(
+                f"✅ Найдены чаты:\n"
+                f"  Источник: <code>{source_name}</code> (ID {source_ct['id']})\n"
+                f"  Цель: <code>{target_name}</code> (ID {target_ct['id']})\n\n"
+                f"Теперь отправь название для этого маршрута.",
+                parse_mode="HTML"
+            )
+        else:
             # ---- Однострочный режим ----
-            src_chat = _resolve_source_chat(int(args[1]))
-            src_topic = int(args[2])
-            tgt_chat = int(args[3])
-            tgt_topic = int(args[4])
-            send_time = args[5]
-            intervals_str = args[6]
+            send_time = args[3]
+            intervals_str = args[4]
 
             h, m = map(int, send_time.split(':'))
             if not (0 <= h <= 23 and 0 <= m <= 59):
@@ -227,47 +502,34 @@ async def cmd_add_route(message: types.Message, state: FSMContext):
 
             intervals = parse_intervals_list(intervals_str)
             intervals_json = json.dumps(intervals)
-            jitter_seconds = int(args[7]) if len(args) == 8 else 0
 
-            source_ct_id = add_chat_topic(
-                src_chat, src_topic,
-                name=f"Source {src_chat}:{src_topic}"
-            )
-            target_ct_id = add_chat_topic(
-                tgt_chat, tgt_topic,
-                name=f"Target {tgt_chat}:{tgt_topic}",
-                sendable=True
-            )
+            route_name = f"Маршрут {source_name} → {target_name}"
 
-            route_name = f"Маршрут {src_topic} -> {tgt_chat}"
-
-            # Временно хардкодим route_mode и max_rounds
-            # TODO: добавить выбор route_mode ('bulk'/'singular') и max_rounds
             route_id = add_route(
-                source_ct_id=source_ct_id,
+                source_ct_id=source_ct['id'],
                 route_name=route_name,
-                route_mode='bulk',       # хардкод
+                route_mode='bulk',
                 send_time=send_time,
                 intervals_json=intervals_json,
-                jitter_seconds=jitter_seconds,
-                max_rounds=-1,           # хардкод: бесконечные круги
+                jitter_seconds=0,
+                max_rounds=-1,
             )
-            add_route_target(route_id, target_ct_id)
+            add_route_target(route_id, target_ct['id'])
 
             route = get_route_by_id(route_id)
             schedule_route_job(route)
 
             intervals_display = ', '.join(format_interval(i) for i in intervals)
             await message.answer(
-                f"Маршрут {route_id} создан!\n"
+                f"✅ Маршрут {route_id} создан!\n"
                 f"Название: {route_name}\n"
                 f"Первый пост в {send_time}\n"
                 f"Интервалы: [{intervals_display}]",
                 parse_mode="HTML"
             )
-        else:
-            await message.answer(help_text, parse_mode="HTML")
 
+    except ValueError as e:
+        await message.answer(f"Ошибка: {e}\n\n{help_text}", parse_mode="HTML")
     except Exception as e:
         error_text = str(e).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         await message.answer(f"Ошибка: {error_text}\n\n{help_text}", parse_mode="HTML")
@@ -379,12 +641,13 @@ async def route_step_jitter(message: types.Message, state: FSMContext):
     intervals_display = ', '.join(format_interval(i) for i in intervals)
     jitter_text = f", разброс {format_interval(jitter_seconds)}" if jitter_seconds > 0 else ""
     await message.answer(
-        f"Маршрут {route_id} успешно создан!\n"
+        f"✅ Маршрут {route_id} создан!\n"
         f"Название: {data['route_name']}\n"
-        f"Источник: {data['src_chat']}:{data['src_topic']}\n"
-        f"Цель: {data['tgt_chat']}:{data['tgt_topic']}\n"
+        f"Источник: <code>{data['source_name']}</code>\n"
+        f"Цель: <code>{data['target_name']}</code>\n"
         f"Первый пост в {data['send_time']}\n"
-        f"Интервалы: [{intervals_display}]{jitter_text}"
+        f"Интервалы: [{intervals_display}]{jitter_text}",
+        parse_mode="HTML"
     )
 
 
@@ -402,39 +665,29 @@ async def cmd_list_routes(message: types.Message):
         route_name = r['route_name'] or f"Маршрут {r['id']}"
         intervals = json.loads(r['intervals_json'] or '[]')
         intervals_display = ', '.join(format_interval(i) for i in intervals) if intervals else "нет"
+        status = "✅" if r['is_active'] else "❄️"
 
-        # Статус маршрута
-        status = "✅ активен" if r['is_active'] else "❄️ заморожен"
-
-        # Источник
         source_ct = get_chat_topic_by_id(r['source_ct_id'])
-        if source_ct:
-            src_text = f"чат <code>{source_ct['ct_tg_chat_id']}</code>"
-            if source_ct['ct_tg_topic_id']:
-                src_text += f", топик <code>{source_ct['ct_tg_topic_id']}</code>"
-            else:
-                src_text += " (весь чат)"
-        else:
-            src_text = "неизвестен"
+        src_name = source_ct['ct_name'] if source_ct and source_ct['ct_name'] else f"ID {r['source_ct_id']}"
 
-        # Цели (пока одна, но цикл готов к множественным)
         targets = get_route_targets(r['id'])
-        tgt_texts = []
+        tgt_names = []
         for t in targets:
-            t_text = f"чат <code>{t['ct_tg_chat_id']}</code>"
-            if t['ct_tg_topic_id']:
-                t_text += f", топик <code>{t['ct_tg_topic_id']}</code>"
-            tgt_texts.append(t_text)
-        tgt_display = "\n    ".join(tgt_texts) if tgt_texts else "нет целей"
+            t_name = t['ct_name'] or f"ID {t['ct_id']}"
+            tgt_names.append(f"<code>{t_name}</code>")
+        tgt_display = ", ".join(tgt_names) if tgt_names else "нет целей"
+
+        random_status = "🎲 вкл" if r['use_random_targets'] else "🎲 выкл"
 
         text += (
-            f"ID <code>{r['id']}</code>: {route_name} [{status}]\n"
-            f"  Источник: {src_text}\n"
-            f"  Цели:\n    {tgt_display}\n"
-            f"  Первый пост: {r['send_time']}\n"
-            f"  Интервалы: [{intervals_display}]\n"
-            f"  Разброс: {r['jitter_seconds']} сек.\n\n"
+            f"{status} ID <code>{r['id']}</code>: {route_name}\n"
+            f"   Источник: <code>{src_name}</code>\n"
+            f"   Гарантированные цели: {tgt_display}\n"
+            f"   Случайная рассылка: {random_status}\n"
+            f"   Старт: {r['send_time']} | Интервалы: [{intervals_display}]\n"
+            f"   Разброс: {r['jitter_seconds']} сек.\n\n"
         )
+
     await message.answer(text, parse_mode="HTML")
 
 
@@ -461,7 +714,7 @@ async def cmd_send_now(message: types.Message):
         await message.answer(f"Я не смогла найти маршрут с ID {route_id}. Проверь /routes")
         return
 
-    await message.answer(f"Пытаюсь отправить пост из маршрута {route_id}...")
+    await message.answer(f"Отправляю пост из маршрута {route_id}...")
     sent = await send_random_post_job(route_id, manual_send=True)
     if sent:
         await message.answer("Готово! Проверь целевой чат :)")
@@ -503,6 +756,39 @@ async def cmd_delete_route(message: types.Message):
     else:
         await message.answer(f"Не удалось удалить маршрут {route_id} из базы.")
 
+@commands_router.message(Command("toggle_random"), F.from_user.id == ADMIN_ID)
+async def cmd_toggle_random(message: types.Message):
+    """Переключает флаг для массовой рассылки из указанного ID источника"""
+    if not message.text:
+        return
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer(
+            "Формат: <code>/toggle_random &lt;ID маршрута&gt;</code>",
+            parse_mode="HTML"
+        )
+        return
+    try:
+        route_id = int(args[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+
+    route = get_route_by_id(route_id)
+    if not route:
+        await message.answer(f"Маршрут {route_id} не найден.")
+        return
+
+    new_value = not bool(route['use_random_targets'])
+    if update_route(route_id, use_random_targets=new_value):
+        status = "✅ ВКЛЮЧЕНА" if new_value else "❌ ВЫКЛЮЧЕНА"
+        await message.answer(
+            f"Случайная рассылка для маршрута {route_id} {status}.\n"
+            f"Теперь посты будут уходить в гарантированные цели "
+            f"{'+' if new_value else ''}{'один случайный sendable-чат' if new_value else ''}."
+        )
+    else:
+        await message.answer("Не удалось обновить.")
 
 # ---- Заморозка/разморозка маршрутов ----
 
@@ -527,7 +813,6 @@ async def cmd_freeze_route(message: types.Message):
     if not route:
         await message.answer(f"Маршрут {route_id} не найден.")
         return
-
     if not route['is_active']:
         await message.answer(f"Маршрут {route_id} уже заморожен.")
         return
@@ -696,10 +981,9 @@ async def cmd_edit_jitter(message: types.Message):
     # Проверяем, что разброс меньше минимального интервала
     intervals = json.loads(route['intervals_json'] or '[]')
     if intervals and jitter_seconds >= min(intervals):
-        min_interval = min(intervals)
         await message.answer(
             f"Разброс ({jitter_seconds} сек.) должен быть меньше "
-            f"минимального интервала ({format_interval(min_interval)})."
+            f"минимального интервала ({format_interval(min(intervals))})."
         )
         return
 
@@ -960,15 +1244,16 @@ async def send_random_post_job(route_id: int, _attempt: int = 0, manual_send: bo
         return await send_random_post_job(route_id, _attempt + 1, manual_send)
 
     try:
+        # 1. Отправляем во все ГАРАНТИРОВАННЫЕ цели
+        guaranteed_ct_ids = []
         for target in targets:
             target_chat_id = target['ct_tg_chat_id']
             target_topic_id = target['ct_tg_topic_id']
+            guaranteed_ct_ids.append(target['ct_id'])
 
             send_kwargs = {}
             if target_topic_id:
                 send_kwargs['message_thread_id'] = target_topic_id
-
-            # TODO: добавить подпись через get_note_for_target(route_id, target['ct_id'])
 
             if len(message_ids) > 1 and hasattr(bot, 'copy_messages'):
                 await bot.copy_messages(
@@ -986,6 +1271,51 @@ async def send_random_post_job(route_id: int, _attempt: int = 0, manual_send: bo
                         **send_kwargs,
                     )
 
+        # 2. Если включена случайная рассылка — выбираем один случайный sendable-чат
+        if route['use_random_targets']:
+            random_pool = get_random_sendable_targets(exclude_ids=guaranteed_ct_ids)
+            if random_pool:
+                random_target = random.choice(random_pool)
+                target_chat_id = random_target['ct_tg_chat_id']
+                target_topic_id = random_target['ct_tg_topic_id']
+
+                send_kwargs = {}
+                if target_topic_id:
+                    send_kwargs['message_thread_id'] = target_topic_id
+
+                logging.info(
+                    f"Маршрут {route_id}: случайная отправка в "
+                    f"{random_target['ct_name'] or target_chat_id}"
+                )
+
+                try:
+                    if len(message_ids) > 1 and hasattr(bot, 'copy_messages'):
+                        await bot.copy_messages(
+                            chat_id=target_chat_id,
+                            from_chat_id=source_chat_id,
+                            message_ids=message_ids,
+                            **send_kwargs,
+                        )
+                    else:
+                        for msg_id in message_ids:
+                            await bot.copy_message(
+                                chat_id=target_chat_id,
+                                from_chat_id=source_chat_id,
+                                message_id=msg_id,
+                                **send_kwargs,
+                            )
+                except Exception as e:
+                    # Если случайный чат недоступен — логируем, но не падаем
+                    logging.warning(
+                        f"Не удалось отправить в случайный чат "
+                        f"{target_chat_id}: {e}"
+                    )
+            else:
+                logging.info(
+                    f"Маршрут {route_id}: случайная рассылка включена, "
+                    f"но пул sendable-чатов пуст (после исключения гарантированных)."
+                )
+
         mark_post_sent(post['id'])
         if not manual_send:
             _schedule_next_publication(route_id, route)
@@ -995,7 +1325,7 @@ async def send_random_post_job(route_id: int, _attempt: int = 0, manual_send: bo
     except Exception as e:
         if is_missing_source_message_error(e):
             logging.warning(
-                f"Пост {post['id']} недоступен. Удаляю и пробую следующий "
+                f"Пост {post['id']} недоступен. Удаляю и пробую следующий\n"
                 f"(попытка {_attempt + 1}/{MAX_ATTEMPTS})."
             )
             delete_post(post['id'])
@@ -1183,6 +1513,7 @@ async def set_bot_commands():
         types.BotCommand(command="import_message", description="Импортировать одно сообщение"),
         types.BotCommand(command="import_range", description="Импортировать диапазон"),
         types.BotCommand(command="skip_next", description="Пропустить публикацию"),
+        types.BotCommand(command="toggle_random", description="Вкл/выкл случайную рассылку"),
     ])
 
 

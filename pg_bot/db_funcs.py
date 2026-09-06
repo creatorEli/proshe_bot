@@ -42,6 +42,7 @@ def init_db():
         max_rounds INTEGER DEFAULT -1,
         completed_rounds INTEGER DEFAULT 0,
         is_active INTEGER DEFAULT 1,
+        use_random_targets INTEGER DEFAULT 0,
         FOREIGN KEY(source_ct_id) REFERENCES chats_topics(id)
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS route_targets (
@@ -158,19 +159,20 @@ def update_chat_topic(ct_id: int, **kwargs) -> bool:
 # routes
 # ============================================================
 
-def add_route(source_ct_id: int, route_name: str = None,  # type: ignore
-              route_mode: str = 'bulk', send_time: str = None,  # type: ignore
+def add_route(source_ct_id: int, route_name: str = None,
+              route_mode: str = 'bulk', send_time: str = None,
               intervals_json: str = '[]', jitter_seconds: int = 0,
-              max_rounds: int = -1) -> int:
+              max_rounds: int = -1, use_random_targets: bool = False) -> int:
     conn = _get_conn()
     c = conn.cursor()
     c.execute(
         '''INSERT INTO routes
         (route_name, route_mode, source_ct_id, send_time, intervals_json,
-         jitter_seconds, max_rounds)
-        VALUES (?, ?, ?, ?, ?, ?, ?)''',
+         jitter_seconds, max_rounds, use_random_targets)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
         (route_name, route_mode, source_ct_id, send_time,
-         intervals_json, int(jitter_seconds), int(max_rounds))
+         intervals_json, int(jitter_seconds), int(max_rounds),
+         int(use_random_targets))
     )
     conn.commit()
     route_id = c.lastrowid
@@ -210,13 +212,16 @@ def update_route(route_id: int, **kwargs) -> bool:
     allowed = {
         'route_name', 'route_mode', 'source_ct_id', 'send_time',
         'intervals_json', 'interval_index', 'jitter_seconds',
-        'next_run_time', 'max_rounds', 'completed_rounds', 'is_active'
+        'next_run_time', 'max_rounds', 'completed_rounds', 'is_active',
+        'use_random_targets',
     }
     fields = {k: v for k, v in kwargs.items() if k in allowed}
     if not fields:
         return False
-    if 'is_active' in fields:
-        fields['is_active'] = int(fields['is_active'])
+    for key in ('is_active', 'use_random_targets'):   # <-- добавлено
+        if key in fields:
+            fields[key] = int(fields[key])
+    
     set_clause = ', '.join(f'{k} = ?' for k in fields)
     values = list(fields.values()) + [route_id]
     conn = _get_conn()
@@ -479,9 +484,110 @@ def get_posts_count(route_id: int) -> dict:
     sent = row['sent'] or 0
     return {'total': total, 'sent': sent, 'unsent': total - sent}
 
+
+# ============================================================
+# Поиск по имени и удаление
+# ============================================================
+
+def get_chat_topic_by_name(name: str) -> Optional[sqlite3.Row]:
+    """
+    Ищет чат/топик по имени (ct_name).
+    Возвращает запись или None, если не найдено.
+    Если имён несколько — возвращает первое (активное приоритетнее).
+    """
+    conn = _get_conn()
+    c = conn.cursor()
+    # Сначала ищем среди активных
+    c.execute(
+        'SELECT * FROM chats_topics WHERE ct_name = ? AND is_active = 1 LIMIT 1',
+        (name,)
+    )
+    row = c.fetchone()
+    if row:
+        conn.close()
+        return row
+    # Если нет активных — ищем среди всех
+    c.execute(
+        'SELECT * FROM chats_topics WHERE ct_name = ? LIMIT 1',
+        (name,)
+    )
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def check_chat_topic_in_use(ct_id: int) -> dict:
+    """
+    Проверяет, используется ли чат/топик в маршрутах.
+    Возвращает {'as_source': [...ids], 'as_target': [...ids]}
+    """
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute('SELECT id FROM routes WHERE source_ct_id = ?', (ct_id,))
+    as_source = [r['id'] for r in c.fetchall()]
+    c.execute(
+        'SELECT route_id FROM route_targets WHERE ct_id = ?',
+        (ct_id,)
+    )
+    as_target = [r['route_id'] for r in c.fetchall()]
+    conn.close()
+    return {'as_source': as_source, 'as_target': as_target}
+
+
+def delete_chat_topic(ct_id: int) -> tuple[bool, str]:
+    """
+    Удаляет чат/топик. Возвращает (успех, сообщение).
+    Отказывается удалять, если чат используется в маршрутах.
+    """
+    usage = check_chat_topic_in_use(ct_id)
+    if usage['as_source'] or usage['as_target']:
+        all_routes = sorted(set(usage['as_source'] + usage['as_target']))
+        return False, (
+            f"Чат используется в маршрутах: {all_routes}. "
+            f"Сначала удалите эти маршруты."
+        )
+
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute('DELETE FROM chats_topics WHERE id = ?', (ct_id,))
+    conn.commit()
+    deleted = c.rowcount > 0
+    conn.close()
+    if deleted:
+        return True, "Чат удалён."
+    return False, "Чат не найден."
+
+
 # ============================================================
 # Поиск маршрутов по источнику (для collector_router)
 # ============================================================
+
+def get_random_sendable_targets(exclude_ids: list[int]) -> list[sqlite3.Row]:
+    """
+    Возвращает все активные sendable-чаты, КРОМЕ указанных в exclude_ids.
+    Используется для случайной рассылки.
+    """
+    conn = _get_conn()
+    c = conn.cursor()
+    
+    if exclude_ids:
+        placeholders = ','.join('?' * len(exclude_ids))
+        c.execute(
+            f'''SELECT * FROM chats_topics
+                WHERE is_active = 1 AND ct_sendable = 1
+                  AND id NOT IN ({placeholders})''',
+            exclude_ids
+        )
+    else:
+        c.execute(
+            '''SELECT * FROM chats_topics
+               WHERE is_active = 1 AND ct_sendable = 1'''
+        )
+    
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
 
 def get_routes_for_source(tg_chat_id: int, tg_topic_id: int = 0) -> list[sqlite3.Row]:
     """
