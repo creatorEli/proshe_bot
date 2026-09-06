@@ -26,6 +26,7 @@ def init_db():
         ct_tg_topic_id INTEGER DEFAULT 0,
         ct_note TEXT DEFAULT NULL,
         ct_sendable INTEGER DEFAULT 0,
+        ct_promotable INTEGER DEFAULT 0,
         is_active INTEGER DEFAULT 1,
         UNIQUE(ct_tg_chat_id, ct_tg_topic_id)
     )''')

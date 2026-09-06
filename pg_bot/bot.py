@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from config import ADMIN_ID, API_TOKEN, MAIN_SOURCE_CHAT_ID, TIMEZONE
 
 from db_funcs import (
+    get_sendable_chat_topics,
     init_db,
     add_chat_topic, get_chat_topic_by_id, get_chat_topic_by_tg_ids,
     get_chat_topic_by_name, get_all_chat_topics,
@@ -25,7 +26,8 @@ from db_funcs import (
     get_random_unsent_post, delete_post,
     get_routes_for_source,
     update_route, update_chat_topic, delete_chat_topic, check_chat_topic_in_use,
-    get_random_sendable_targets,   # <-- новая функция
+    get_random_sendable_targets,
+    increment_completed_rounds, deactivate_route,
 )
 
 bot = Bot(token=API_TOKEN)
@@ -40,6 +42,8 @@ class AddRouteStates(StatesGroup):
     waiting_for_intervals = State()
     waiting_for_jitter = State()
 
+class SingularImportStates(StatesGroup):
+    waiting_for_forward = State()
 
 commands_router = Router()
 collector_router = Router()
@@ -52,6 +56,11 @@ scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 # Словарь для агрегации галерей
 media_groups = defaultdict(list)
 media_group_timers = {}
+singular_media_groups = defaultdict(list)
+singular_media_group_timers = {}
+
+# Режим импорта singular-постов: {route_id: {'source_chat_id': int, 'admin_id': int, 'expires_at': float}}
+singular_import_active = {}
 
 # ==========================================
 # ТЕКСТЫ И УТИЛИТЫ
@@ -82,8 +91,12 @@ HELP_TEXT = (
     "<code>/edit_jitter &lt;ID&gt; &lt;секунды&gt;</code> — изменить разброс\n"
     "<code>/skip_next &lt;ID&gt;</code> — пропустить ближайшую публикацию\n\n"
     "<code>/toggle_random &lt;ID&gt</code> — вкл/выкл случайную рассылку по sendable-чатaм (для источника)\n"
-    "<code>/add_target &lt;ID маршрута&gt; &lt;имя_чата&gt;</code> — добавить цель к маршруту\n"
+
+    "<code>/add_target &lt;ID&gt; &lt;имена_чатов&gt;</code> — добавить цели (через запятую)\n"
+    "<i>Спец. значения:</i> <code>all</code> (все активные чаты) или <code>sendable</code> (только sendable)\n\n"
     "<code>/remove_target &lt;ID маршрута&gt; &lt;имя_чата&gt;</code> — убрать цель из маршрута\n"
+    "<i>Спец. значения:</i> <code>all</code> (все цели) или <code>sendable</code> (все sendable-чаты из целей)\n\n"
+
     "<b>📥 Импорт сообщений:</b>\n"
     "<code>/import_message &lt;ID маршрута&gt; &lt;ID сообщения&gt;</code>\n"
     "<code>/import_range &lt;ID маршрута&gt; &lt;начальный ID&gt; &lt;конечный ID&gt;</code>\n\n"
@@ -91,7 +104,13 @@ HELP_TEXT = (
     "<b>💡 Подсказки:</b>\n"
     "Имена чатов должны быть уникальными\n"
     "<code>0</code> вместо tg_topic_id — общий поток (без топика)\n"
-    "Флаг «sendable» отмечает чаты, куда можно отправлять (для массовой рассылки)\n"
+    "Флаг «sendable» отмечает чаты, куда можно отправлять (для массовой рассылки)\n\n"
+    "<b>📢 Singular-маршруты (реклама):</b>\n"
+    "<code>/add_singular &lt;имя_источника&gt; &lt;ЧЧ:ММ&gt; &lt;интервалы&gt; [rounds]</code> — создать singular-маршрут\n"
+    "<code>/list_singular</code> — список singular-маршрутов\n"
+    "<code>/set_rounds &lt;ID&gt; &lt;N&gt;</code> — установить количество кругов (-1 = бесконечно)\n"
+    "<code>/extend_route &lt;ID&gt; &lt;N&gt;</code> — продлить маршрут на N кругов\n"
+    "<code>/get_rounds &lt;ID&gt;</code> — показать статус кругов\n\n"
 )
 
 
@@ -134,13 +153,17 @@ def _recalculate_and_reschedule(route_id: int, route):
     send_time = route['send_time']
     if not intervals or not send_time:
         return
+    
     # Вычисляем новое время запуска
     start_date = _calculate_initial_start(send_time)
+
     jitter = route['jitter_seconds'] or 0
     if jitter > 0:
         start_date += timedelta(seconds=random.randint(0, jitter))
+
     # Обновляем расписание в БД
     update_route_schedule(route_id, 0, start_date.isoformat())
+
     # Обновляем задачу в планировщике
     job_id = f"route_{route_id}"
     scheduler.add_job(
@@ -537,10 +560,273 @@ async def cmd_add_route(message: types.Message, state: FSMContext):
         await message.answer(f"Ошибка: {error_text}\n\n{help_text}", parse_mode="HTML")
 
 
+@commands_router.message(Command("add_singular"), F.from_user.id == ADMIN_ID)
+async def cmd_add_singular(message: types.Message):
+    if not message.text:
+        return
+    args = message.text.split()
+    
+    if len(args) < 4 or len(args) > 5:
+        await message.answer(
+            "<b>Формат:</b>\n"
+            "<code>/add_singular &lt;имя_источника&gt; &lt;ЧЧ:ММ&gt; &lt;интервалы&gt; [rounds]</code>\n\n"
+            "<b>Примеры:</b>\n"
+            "<code>/add_singular ads_archive 18:00 01:00:00:00</code> — бесконечно\n"
+            "<code>/add_singular ads_archive 18:00 01:00:00:00 10</code> — 10 кругов\n\n"
+            "После создания добавь цели через /add_target",
+            parse_mode="HTML"
+        )
+        return
+    
+    try:
+        source_name = args[1]
+        send_time = args[2]
+        intervals_str = args[3]
+        max_rounds = int(args[4]) if len(args) == 5 else -1
+        
+        # Валидация времени
+        h, m = map(int, send_time.split(':'))
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError("Неверное время")
+        
+        # Парсим интервалы
+        intervals = parse_intervals_list(intervals_str)
+        intervals_json = json.dumps(intervals)
+        
+        # Ищем источник
+        source_ct = get_chat_topic_by_name(source_name)
+        if not source_ct:
+            await message.answer(
+                f"❌ Исходный чат <code>{source_name}</code> не найден.\n"
+                f"Зарегистрируй его через /add_chat",
+                parse_mode="HTML"
+            )
+            return
+        
+        # Создаём singular-маршрут
+        route_id = add_route(
+            source_ct_id=source_ct['id'],
+            route_name=f"Singular: {source_name}",
+            route_mode='singular',
+            send_time=send_time,
+            intervals_json=intervals_json,
+            jitter_seconds=0,
+            max_rounds=max_rounds,
+        )
+        
+        route = get_route_by_id(route_id)
+        schedule_route_job(route)
+        
+        rounds_text = "бесконечно" if max_rounds == -1 else f"{max_rounds} кругов"
+        intervals_display = ', '.join(format_interval(i) for i in intervals)
+        
+        await message.answer(
+            f"✅ Singular-маршрут {route_id} создан!\n"
+            f"Источник: <code>{source_name}</code>\n"
+            f"Первый пост в {send_time}\n"
+            f"Интервалы: [{intervals_display}]\n"
+            f"Кругов: {rounds_text}\n\n"
+            f"Теперь добавь цели через /add_target {route_id} &lt;имя_чата&gt;",
+            parse_mode="HTML"
+        )
+        
+    except ValueError as e:
+        await message.answer(f"Ошибка: {e}")
+
+
+@commands_router.message(Command("list_singular"), F.from_user.id == ADMIN_ID)
+async def cmd_list_singular(message: types.Message):
+    routes = get_all_routes(active_only=False)
+    singular_routes = [r for r in routes if r['route_mode'] == 'singular']
+    
+    if not singular_routes:
+        await message.answer("Singular-маршрутов пока нет.")
+        return
+    
+    text = "<b>📢 Singular-маршруты:</b>\n\n"
+    for r in singular_routes:
+        route_name = r['route_name'] or f"Маршрут {r['id']}"
+        status = "✅" if r['is_active'] else "❄️"
+        
+        source_ct = get_chat_topic_by_id(r['source_ct_id'])
+        src_name = source_ct['ct_name'] if source_ct and source_ct['ct_name'] else f"ID {r['source_ct_id']}"
+        
+        targets = get_route_targets(r['id'], active_only=False)
+        tgt_names = [t['ct_name'] or f"ID {t['ct_id']}" for t in targets]
+        tgt_display = ", ".join(tgt_names) if tgt_names else "нет целей"
+
+        intervals = json.loads(r['intervals_json'] or '[]')
+        intervals_display = ', '.join(format_interval(i) for i in intervals) if intervals else "нет"
+                
+        
+        completed = r['completed_rounds']
+        max_r = r['max_rounds']
+        if max_r == -1:
+            rounds_text = f"{completed} (бесконечно)"
+        else:
+            rounds_text = f"{completed}/{max_r}"
+        
+        text += (
+            f"{status} ID <code>{r['id']}</code>: {route_name}\n"
+            f"   Ист: <code>{src_name}</code>\n"
+            f"   Цел: {tgt_display}\n"
+            f"   Круги: {rounds_text}\n"
+            f"   Старт: {r['send_time']} | Интервалы: [{intervals_display}]\n\n"
+        )
+    
+    await message.answer(text, parse_mode="HTML")
+
+
+@commands_router.message(Command("set_rounds"), F.from_user.id == ADMIN_ID)
+async def cmd_set_rounds(message: types.Message):
+    if not message.text:
+        return
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer(
+            "Формат: <code>/set_rounds &lt;ID&gt; &lt;N&gt;</code>\n"
+            "Пример: <code>/set_rounds 5 10</code> — 10 кругов\n"
+            "Пример: <code>/set_rounds 5 -1</code> — бесконечно",
+            parse_mode="HTML"
+        )
+        return
+    
+    try:
+        route_id = int(args[1])
+        max_rounds = int(args[2])
+    except ValueError:
+        await message.answer("ID и количество должны быть числами.")
+        return
+    
+    route = get_route_by_id(route_id)
+    if not route:
+        await message.answer(f"Маршрут {route_id} не найден.")
+        return
+    
+    if route['route_mode'] != 'singular':
+        await message.answer("Эта команда только для singular-маршрутов.")
+        return
+    
+    if update_route(route_id, max_rounds=max_rounds):
+        rounds_text = "бесконечно" if max_rounds == -1 else f"{max_rounds} кругов"
+        await message.answer(f"✅ Для маршрута {route_id} установлено: {rounds_text}")
+    else:
+        await message.answer("Не удалось обновить.")
+
+
+@commands_router.message(Command("extend_route"), F.from_user.id == ADMIN_ID)
+async def cmd_extend_route(message: types.Message):
+    if not message.text:
+        return
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer(
+            "Формат: <code>/extend_route &lt;ID&gt; &lt;N&gt;</code>\n"
+            "Пример: <code>/extend_route 5 5</code> — добавить ещё 5 кругов",
+            parse_mode="HTML"
+        )
+        return
+    
+    try:
+        route_id = int(args[1])
+        add_rounds = int(args[2])
+    except ValueError:
+        await message.answer("ID и количество должны быть числами.")
+        return
+    
+    route = get_route_by_id(route_id)
+    if not route:
+        await message.answer(f"Маршрут {route_id} не найден.")
+        return
+    
+    if route['route_mode'] != 'singular':
+        await message.answer("Эта команда только для singular-маршрутов.")
+        return
+    
+    current_max = route['max_rounds']
+    if current_max == -1:
+        await message.answer("Маршрут уже бесконечный.")
+        return
+    
+    new_max = current_max + add_rounds
+    if update_route(route_id, max_rounds=new_max):
+        # Если маршрут был деактивирован — активируем его
+        if not route['is_active']:
+            update_route(route_id, is_active=True)
+            _recalculate_and_reschedule(route_id, get_route_by_id(route_id))
+        
+        await message.answer(
+            f"✅ Маршрут {route_id} продлён.\n"
+            f"Было: {current_max} кругов\n"
+            f"Стало: {new_max} кругов"
+        )
+    else:
+        await message.answer("Не удалось продлить маршрут.")
+
+
+@commands_router.message(Command("get_rounds"), F.from_user.id == ADMIN_ID)
+async def cmd_get_rounds(message: types.Message):
+    if not message.text:
+        return
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Формат: <code>/get_rounds &lt;ID&gt;</code>", parse_mode="HTML")
+        return
+    
+    try:
+        route_id = int(args[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+    
+    route = get_route_by_id(route_id)
+    if not route:
+        await message.answer(f"Маршрут {route_id} не найден.")
+        return
+    
+    if route['route_mode'] != 'singular':
+        await message.answer("Эта команда только для singular-маршрутов.")
+        return
+    
+    completed = route['completed_rounds']
+    max_r = route['max_rounds']
+    status = "✅ активен" if route['is_active'] else "❄️ завершён"
+    
+    if max_r == -1:
+        rounds_text = f"{completed} (бесконечно)"
+    else:
+        remaining = max(0, max_r - completed)
+        rounds_text = f"{completed}/{max_r} (осталось {remaining})"
+    
+    await message.answer(
+        f"Singular-маршрут {route_id}:\n"
+        f"Статус: {status}\n"
+        f"Круги: {rounds_text}",
+        parse_mode="HTML"
+    )
+
+
+
 @commands_router.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.clear()
+    
+    # Очищаем режим импорта, если он был активен для этого админа
+    routes_to_delete = [
+        r_id for r_id, data in singular_import_active.items() 
+        if data['admin_id'] == message.from_user.id
+    ]
+    for r_id in routes_to_delete:
+        del singular_import_active[r_id]
+    
+    # Очищаем таймеры галерей
+    for key in list(singular_media_group_timers.keys()):
+        singular_media_group_timers[key].cancel()
+        singular_media_group_timers.pop(key, None)
+        singular_media_groups.pop(key, None)
+        
     await message.answer("Действие отменено.")
+
 
 
 # ---- FSM-шаги пошагового добавления ----
@@ -683,11 +969,11 @@ async def cmd_list_routes(message: types.Message):
 
         text += (
             f"{status} ID <code>{r['id']}</code>: {route_name}\n"
-            f"   Источник: <code>{src_name}</code>\n"
-            f"   Гарантированные цели: {tgt_display}\n"
-            f"   Случайная рассылка: {random_status}\n"
-            f"   Старт: {r['send_time']} | Интервалы: [{intervals_display}]\n"
-            f"   Разброс: {r['jitter_seconds']} сек.\n\n"
+            f"   Ист: <code>{src_name}</code>\n"
+            f"   Цел: {tgt_display}\n"
+            f"   Случ.расс.{random_status}\n"
+            f"   Старт: {r['send_time']} | Инт-ы: [{intervals_display}]\n"
+            f"   Jit: {r['jitter_seconds']} сек.\n\n"
         )
 
     await message.answer(text, parse_mode="HTML")
@@ -763,18 +1049,24 @@ async def cmd_delete_route(message: types.Message):
 async def cmd_add_target(message: types.Message):
     if not message.text:
         return
-    args = message.text.split()
-    if len(args) != 3:
+    
+    # Используем maxsplit=2, чтобы всё после ID маршрута попало в одну строку
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
         await message.answer(
-            "Формат: <code>/add_target &lt;ID маршрута&gt; &lt;имя_чата&gt;</code>\n"
-            "Пример: <code>/add_target 1 my_channel</code>",
+            "<b>Формат:</b>\n"
+            "<code>/add_target &lt;ID маршрута&gt; &lt;имена_чатов&gt;</code>\n\n"
+            "<b>Примеры:</b>\n"
+            "<code>/add_target 1 channel_a, channel_b</code>\n"
+            "<code>/add_target 1 all</code> — добавить все активные чаты (даже источники)\n"
+            "<code>/add_target 1 sendable</code> — добавить все чаты с флагом sendable",
             parse_mode="HTML"
         )
         return
 
     try:
         route_id = int(args[1])
-        target_name = args[2]
+        targets_str = args[2].strip()
     except ValueError:
         await message.answer("ID маршрута должен быть числом.")
         return
@@ -784,50 +1076,90 @@ async def cmd_add_target(message: types.Message):
         await message.answer(f"Маршрут {route_id} не найден.")
         return
 
-    target_ct = get_chat_topic_by_name(target_name)
-    if not target_ct:
-        await message.answer(
-            f"❌ Чат <code>{target_name}</code> не найден.\n"
-            f"Зарегистрируй его через /add_chat или проверь /chats",
-            parse_mode="HTML"
-        )
-        return
+    source_ct_id = route['source_ct_id']
 
-    # Проверяем, не является ли этот чат источником маршрута
-    if target_ct['id'] == route['source_ct_id']:
-        await message.answer(
-            "❌ Нельзя добавить источник маршрута в качестве его же цели."
-        )
-        return
+    # Получаем текущие цели, чтобы не добавлять дубликаты
+    current_targets = get_route_targets(route_id, active_only=False)
+    current_target_ct_ids = {t['ct_id'] for t in current_targets}
 
-    if add_route_target(route_id, target_ct['id']):
-        target_display = target_ct['ct_name'] or f"ID {target_ct['id']}"
-        await message.answer(
-            f"✅ Цель <code>{target_display}</code> добавлена к маршруту {route_id}.\n"
-            f"Теперь посты будут уходить во все гарантированные цели.",
-            parse_mode="HTML"
-        )
+    chats_to_add = []
+
+    # 1. Обработка спец. команд
+    if targets_str.lower() == 'all':
+        chats_to_add = get_all_chat_topics(active_only=True)
+    elif targets_str.lower() == 'sendable':
+        chats_to_add = get_sendable_chat_topics()
     else:
-        await message.answer(
-            f"⚠️ Этот чат уже является целью маршрута {route_id}."
-        )
+        # 2. Обработка перечисления имён (поддерживаем и запятые, и пробелы)
+        names = [name.strip() for name in targets_str.replace(',', ' ').split() if name.strip()]
+        for name in names:
+            ct = get_chat_topic_by_name(name)
+            if ct:
+                chats_to_add.append(ct)
+            else:
+                await message.answer(f"⚠️ Чат с именем <code>{name}</code> не найден.", parse_mode="HTML")
+
+    if not chats_to_add:
+        await message.answer("Не найдено чатов для добавления.")
+        return
+
+    added_count = 0
+    skipped_count = 0
+    source_warning = False
+
+    for ct in chats_to_add:
+        # Пропускаем, если уже является целью
+        if ct['id'] in current_target_ct_ids:
+            skipped_count += 1
+            continue
+
+        # Предупреждаем, если добавляем источник в качестве цели (но не блокируем, как просили)
+        if ct['id'] == source_ct_id:
+            source_warning = True
+
+        if add_route_target(route_id, ct['id']):
+            added_count += 1
+        else:
+            skipped_count += 1
+
+    # Формируем красивый отчёт для админа
+    report = []
+    if added_count > 0:
+        report.append(f"✅ <b>Добавлено целей:</b> {added_count}")
+    if skipped_count > 0:
+        report.append(f"⏭️ <b>Пропущено</b> (уже были целями или не найдены): {skipped_count}")
+    
+    if source_warning:
+        report.append("⚠️ <i>Внимание: среди добавленных есть исходный чат этого маршрута.</i>")
+
+    if not report:
+        report.append("Все указанные чаты уже являются целями этого маршрута.")
+
+    await message.answer("\n".join(report), parse_mode="HTML")
 
 
 @commands_router.message(Command("remove_target"), F.from_user.id == ADMIN_ID)
 async def cmd_remove_target(message: types.Message):
     if not message.text:
         return
-    args = message.text.split()
-    if len(args) != 3:
+    
+    # Используем maxsplit=2, чтобы всё после ID маршрута попало в одну строку
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
         await message.answer(
-            "Формат: <code>/remove_target &lt;ID маршрута&gt; &lt;имя_чата&gt;</code>",
+            "<b>Формат:</b>\n"
+            "<code>/remove_target &lt;ID маршрута&gt; &lt;имена_чатов&gt;</code>\n\n"
+            "<b>Примеры:</b>\n"
+            "<code>/remove_target 1 channel_a, channel_b</code>\n"
+            "<code>/remove_target 1 all</code> — убрать все цели\n"
+            "<code>/remove_target 1 sendable</code> — убрать все sendable-чаты из целей",
             parse_mode="HTML"
         )
         return
 
     try:
         route_id = int(args[1])
-        target_name = args[2]
+        targets_str = args[2].strip()
     except ValueError:
         await message.answer("ID маршрута должен быть числом.")
         return
@@ -837,22 +1169,69 @@ async def cmd_remove_target(message: types.Message):
         await message.answer(f"Маршрут {route_id} не найден.")
         return
 
-    target_ct = get_chat_topic_by_name(target_name)
-    if not target_ct:
-        await message.answer(f"Чат <code>{target_name}</code> не найден.", parse_mode="HTML")
+    # Получаем текущие цели
+    current_targets = get_route_targets(route_id, active_only=False)
+    if not current_targets:
+        await message.answer(f"У маршрута {route_id} нет целей.")
         return
 
-    if remove_route_target(route_id, target_ct['id']):
-        target_display = target_ct['ct_name'] or f"ID {target_ct['id']}"
-        await message.answer(
-            f"✅ Цель <code>{target_display}</code> убрана из маршрута {route_id}.",
-            parse_mode="HTML"
-        )
+    chats_to_remove = []
+
+    # 1. Обработка спец. команд
+    if targets_str.lower() == 'all':
+        chats_to_remove = list(current_targets)
+    elif targets_str.lower() == 'sendable':
+        chats_to_remove = [t for t in current_targets if t['ct_sendable']]
     else:
-        await message.answer(
-            f"⚠️ Чат <code>{target_name}</code> не является целью маршрута {route_id}.",
-            parse_mode="HTML"
-        )
+        # 2. Обработка перечисления имён (поддерживаем и запятые, и пробелы)
+        names = [name.strip() for name in targets_str.replace(',', ' ').split() if name.strip()]
+        for name in names:
+            ct = get_chat_topic_by_name(name)
+            if ct:
+                # Проверяем, что этот чат действительно является целью маршрута
+                if any(t['ct_id'] == ct['id'] for t in current_targets):
+                    chats_to_remove.append(ct)
+                else:
+                    await message.answer(
+                        f"⚠️ Чат <code>{name}</code> не является целью маршрута {route_id}.",
+                        parse_mode="HTML"
+                    )
+            else:
+                await message.answer(
+                    f"⚠️ Чат с именем <code>{name}</code> не найден.",
+                    parse_mode="HTML"
+                )
+
+    if not chats_to_remove:
+        await message.answer("Не найдено целей для удаления.")
+        return
+
+    removed_count = 0
+    skipped_count = 0
+
+    for ct in chats_to_remove:
+        if remove_route_target(route_id, ct['id']):
+            removed_count += 1
+        else:
+            skipped_count += 1
+
+    # Формируем отчёт
+    report = []
+    if removed_count > 0:
+        report.append(f"✅ <b>Убрано целей:</b> {removed_count}")
+    if skipped_count > 0:
+        report.append(f"⏭️ <b>Пропущено:</b> {skipped_count}")
+
+    if not report:
+        report.append("Ни одна цель не была удалена.")
+
+    # Предупреждение, если целей не осталось
+    remaining_targets = get_route_targets(route_id, active_only=False)
+    if not remaining_targets:
+        report.append("⚠️ <i>Внимание: у маршрута больше нет целей. Добавьте хотя бы одну через /add_target.</i>")
+
+    await message.answer("\n".join(report), parse_mode="HTML")
+
 
 
 @commands_router.message(Command("toggle_random"), F.from_user.id == ADMIN_ID)
@@ -1098,6 +1477,58 @@ async def cmd_edit_jitter(message: types.Message):
 
 # ---- Импорт сообщений ----
 
+@commands_router.message(Command("import_singular"), F.from_user.id == ADMIN_ID)
+async def cmd_import_singular(message: types.Message):
+    """Активирует режим прослушивания исходного чата для импорта singular-поста."""
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer(
+            "Формат: <code>/import_singular &lt;ID маршрута&gt;</code>",
+            parse_mode="HTML"
+        )
+        return
+    
+    try:
+        route_id = int(args[1])
+    except ValueError:
+        await message.answer("ID маршрута должен быть числом.")
+        return
+
+    route = get_route_by_id(route_id)
+    if not route or route['route_mode'] != 'singular':
+        await message.answer(f"Маршрут {route_id} не найден или не является singular.")
+        return
+
+    source_ct = get_chat_topic_by_id(route['source_ct_id'])
+    if not source_ct:
+        await message.answer("Ошибка: не найден исходный чат маршрута.")
+        return
+
+    # Активируем режим прослушивания на 60 секунд
+    singular_import_active[route_id] = {
+        'source_chat_id': source_ct['ct_tg_chat_id'],
+        'admin_id': message.from_user.id,
+        'expires_at': asyncio.get_event_loop().time() + 60
+    }
+
+    await message.answer(
+        f"✅ <b>Режим импорта для маршрута {route_id} активирован на 60 секунд!</b>\n\n"
+        f"📌 <b>Что делать:</b>\n"
+        f"1. Зайди в исходный чат: <code>{source_ct['ct_tg_chat_id']}</code>\n"
+        f"2. Выбери нужное сообщение или <b>всю галерею</b>.\n"
+        f"3. <b>Перешли (Forward)</b> его прямо в этот же чат.\n\n"
+        f"Бот автоматически перехватит его, сохранит точные ID и уведомит тебя здесь.\n"
+        f"<i>Для отмены напиши /cancel</i>",
+        parse_mode="HTML"
+    )
+
+@commands_router.message(
+    F.forward_from_chat, 
+    SingularImportStates.waiting_for_forward, 
+    F.from_user.id == ADMIN_ID
+)
+
+
 @commands_router.message(Command("import_message"), F.from_user.id == ADMIN_ID)
 async def cmd_import_message(message: types.Message):
     """Импортирует конкретное сообщение по ID маршрута и ID сообщения."""
@@ -1132,6 +1563,7 @@ async def cmd_import_message(message: types.Message):
         from_chat_id=source_chat_id,
         message_id=msg_id,
     )
+
     try:
         await bot.delete_message(chat_id=message.chat.id, message_id=sent_msg.message_id)
     except Exception as e:
@@ -1317,9 +1749,14 @@ async def send_random_post_job(route_id: int, _attempt: int = 0, manual_send: bo
         return False
     source_chat_id = source_ct['ct_tg_chat_id']
 
-    # Получаем цели (пока одна, но цикл готов к множественным)
+    # Получаем цели 
     # TODO: подписи к постам (get_note_for_target) — пока не используем
-    targets = get_route_targets(route_id)
+
+    # Получаем цели
+        # Для singular получаем цели БЕЗ фильтрации по is_active
+        # Для bulk — только активные
+    targets = get_route_targets(route_id, active_only=(route['route_mode'] != 'singular'))
+
     if not targets:
         logging.error(f"У маршрута {route_id} нет активных целей!")
         return False
@@ -1416,6 +1853,27 @@ async def send_random_post_job(route_id: int, _attempt: int = 0, manual_send: bo
                 )
 
         mark_post_sent(post['id'])
+
+        # Для singular увеличиваем счётчик кругов
+        if route['route_mode'] == 'singular':
+            new_rounds = increment_completed_rounds(route_id)
+            
+            # Проверяем лимит
+            if route['max_rounds'] != -1 and new_rounds >= route['max_rounds']:
+                logging.info(
+                    f"Singular-маршрут {route_id}: лимит кругов достигнут "
+                    f"({new_rounds}/{route['max_rounds']})"
+                )
+                deactivate_route(route_id)
+                # Удаляем задачу из планировщика
+                job_id = f"route_{route_id}"
+                if scheduler.get_job(job_id):
+                    scheduler.remove_job(job_id)
+                    logging.info(f"Планировщик: задача {job_id} удалена (лимит достигнут)")
+
+
+        
+
         if not manual_send:
             _schedule_next_publication(route_id, route)
         logging.info(f"Пост отправлен для маршрута {route_id}.")
@@ -1550,7 +2008,7 @@ def _calculate_initial_start(send_time: str) -> datetime:
 
 @collector_router.message()
 async def collect_post(message: types.Message):
-    """Слушаем сообщения из чатов и сохраняем их, если есть подходящий маршрут."""
+    """Слушаем сообщения из чатов и сохраняем их."""
     if message.chat.type == 'private':
         return
     if message.text and message.text.startswith('/'):
@@ -1561,7 +2019,79 @@ async def collect_post(message: types.Message):
     chat_id = message.chat.id
     topic_id = message.message_thread_id or 0
 
-    # Ищем маршруты через новую функцию из db_funcs
+    # ==========================================
+    # 1. ПРОВЕРКА РЕЖИМА ИМПОРТА SINGULAR
+    # ==========================================
+    active_import_route = None
+    import_data = None
+    
+    for r_id, data in list(singular_import_active.items()):
+        if data['source_chat_id'] == chat_id:
+            # Проверяем, не истёк ли таймаут
+            if asyncio.get_event_loop().time() > data['expires_at']:
+                del singular_import_active[r_id]
+                continue
+            active_import_route = r_id
+            import_data = data
+            break
+
+    if active_import_route:
+        # Мы в режиме импорта! Сохраняем пост именно в этот маршрут.
+        media_group_id = message.media_group_id
+        
+        if media_group_id:
+            key = (active_import_route, media_group_id)
+            singular_media_groups[key].append(message.message_id)
+            if key in singular_media_group_timers:
+                singular_media_group_timers[key].cancel()
+            
+            async def save_singular_import(key=key, r_id=active_import_route, admin_id=import_data['admin_id']):
+                await asyncio.sleep(5)
+                msg_ids = sorted(list(set(singular_media_groups.pop(key, []))))
+                singular_media_group_timers.pop(key, None)
+                
+                if msg_ids:
+                    save_post(r_id, msg_ids)
+                    # Уведомляем админа в личные сообщения
+                    try:
+                        await bot.send_message(
+                            admin_id,
+                            f"✅ <b>Галерея успешно импортирована в маршрут {r_id}!</b>\n"
+                            f"Количество сообщений: {len(msg_ids)}\n"
+                            f"ID: <code>{msg_ids}</code>",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+                    # Отключаем режим после успешного импорта
+                    if r_id in singular_import_active:
+                        del singular_import_active[r_id]
+
+            task = asyncio.create_task(save_singular_import())
+            singular_media_group_timers[key] = task
+            await message.answer("⏳ Принимаю галерею для импорта... (подожди 5 сек)")
+        else:
+            # Одиночное сообщение
+            if save_post(active_import_route, [message.message_id]):
+                try:
+                    await bot.send_message(
+                        import_data['admin_id'],
+                        f"✅ <b>Сообщение <code>{message.message_id}</code> успешно импортировано в маршрут {active_import_route}!</b>",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+                # Отключаем режим
+                if active_import_route in singular_import_active:
+                    del singular_import_active[active_import_route]
+            await message.answer("✅ Сообщение сохранено для импорта.")
+        
+        # ВАЖНО: прерываем выполнение, чтобы не сработала логика bulk
+        return
+
+    # ==========================================
+    # 2. ОБЫЧНАЯ ЛОГИКА BULK (без изменений)
+    # ==========================================
     routes = get_routes_for_source(chat_id, topic_id)
     if not routes:
         return
@@ -1573,17 +2103,15 @@ async def collect_post(message: types.Message):
             media_groups[key].append(message.message_id)
             if key in media_group_timers:
                 media_group_timers[key].cancel()
-
+            
             async def save_media_group(key=key, route_id=route['id']):
                 await asyncio.sleep(5)
                 message_ids = sorted(media_groups.pop(key, []))
                 media_group_timers.pop(key, None)
                 if message_ids:
                     save_post(route_id, message_ids)
-                    logging.info(
-                        f"Галерея из {len(message_ids)} сообщений сохранена для маршрута {route_id}"
-                    )
-
+                    logging.info(f"Галерея из {len(message_ids)} сообщений сохранена для маршрута {route_id}")
+            
             task = asyncio.create_task(save_media_group())
             media_group_timers[key] = task
     else:
@@ -1615,6 +2143,12 @@ async def set_bot_commands():
         types.BotCommand(command="add_target", description="Добавить цель к маршруту"),
         types.BotCommand(command="remove_target", description="Убрать цель из маршрута"),
         types.BotCommand(command="toggle_random", description="Вкл/выкл случайную рассылку"),
+        types.BotCommand(command="add_singular", description="Создать singular-маршрут"),
+        types.BotCommand(command="list_singular", description="Список singular-маршрутов"),
+        types.BotCommand(command="set_rounds", description="Установить количество кругов"),
+        types.BotCommand(command="extend_route", description="Продлить singular-маршрут"),
+        types.BotCommand(command="get_rounds", description="Показать статус кругов"),
+        types.BotCommand(command="import_singular", description="Импорт поста/галереи через пересылку"),
     ])
 
 
