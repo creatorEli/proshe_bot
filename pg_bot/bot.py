@@ -20,7 +20,7 @@ from db_funcs import (
     get_chat_topic_by_name, get_all_chat_topics,
     add_route, get_route_by_id, get_all_routes, update_route_schedule,
     delete_route, skip_next_publication,
-    add_route_target, get_route_targets,
+    add_route_target, get_route_targets,remove_route_target,
     save_post, mark_post_sent, reset_posts_for_route,
     get_random_unsent_post, delete_post,
     get_routes_for_source,
@@ -82,6 +82,8 @@ HELP_TEXT = (
     "<code>/edit_jitter &lt;ID&gt; &lt;секунды&gt;</code> — изменить разброс\n"
     "<code>/skip_next &lt;ID&gt;</code> — пропустить ближайшую публикацию\n\n"
     "<code>/toggle_random &lt;ID&gt</code> — вкл/выкл случайную рассылку по sendable-чатaм (для источника)\n"
+    "<code>/add_target &lt;ID маршрута&gt; &lt;имя_чата&gt;</code> — добавить цель к маршруту\n"
+    "<code>/remove_target &lt;ID маршрута&gt; &lt;имя_чата&gt;</code> — убрать цель из маршрута\n"
     "<b>📥 Импорт сообщений:</b>\n"
     "<code>/import_message &lt;ID маршрута&gt; &lt;ID сообщения&gt;</code>\n"
     "<code>/import_range &lt;ID маршрута&gt; &lt;начальный ID&gt; &lt;конечный ID&gt;</code>\n\n"
@@ -755,6 +757,103 @@ async def cmd_delete_route(message: types.Message):
         await message.answer(f"Ура, я удалила маршрут {route_id} ({route_name})!")
     else:
         await message.answer(f"Не удалось удалить маршрут {route_id} из базы.")
+
+
+@commands_router.message(Command("add_target"), F.from_user.id == ADMIN_ID)
+async def cmd_add_target(message: types.Message):
+    if not message.text:
+        return
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer(
+            "Формат: <code>/add_target &lt;ID маршрута&gt; &lt;имя_чата&gt;</code>\n"
+            "Пример: <code>/add_target 1 my_channel</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        route_id = int(args[1])
+        target_name = args[2]
+    except ValueError:
+        await message.answer("ID маршрута должен быть числом.")
+        return
+
+    route = get_route_by_id(route_id)
+    if not route:
+        await message.answer(f"Маршрут {route_id} не найден.")
+        return
+
+    target_ct = get_chat_topic_by_name(target_name)
+    if not target_ct:
+        await message.answer(
+            f"❌ Чат <code>{target_name}</code> не найден.\n"
+            f"Зарегистрируй его через /add_chat или проверь /chats",
+            parse_mode="HTML"
+        )
+        return
+
+    # Проверяем, не является ли этот чат источником маршрута
+    if target_ct['id'] == route['source_ct_id']:
+        await message.answer(
+            "❌ Нельзя добавить источник маршрута в качестве его же цели."
+        )
+        return
+
+    if add_route_target(route_id, target_ct['id']):
+        target_display = target_ct['ct_name'] or f"ID {target_ct['id']}"
+        await message.answer(
+            f"✅ Цель <code>{target_display}</code> добавлена к маршруту {route_id}.\n"
+            f"Теперь посты будут уходить во все гарантированные цели.",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(
+            f"⚠️ Этот чат уже является целью маршрута {route_id}."
+        )
+
+
+@commands_router.message(Command("remove_target"), F.from_user.id == ADMIN_ID)
+async def cmd_remove_target(message: types.Message):
+    if not message.text:
+        return
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer(
+            "Формат: <code>/remove_target &lt;ID маршрута&gt; &lt;имя_чата&gt;</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        route_id = int(args[1])
+        target_name = args[2]
+    except ValueError:
+        await message.answer("ID маршрута должен быть числом.")
+        return
+
+    route = get_route_by_id(route_id)
+    if not route:
+        await message.answer(f"Маршрут {route_id} не найден.")
+        return
+
+    target_ct = get_chat_topic_by_name(target_name)
+    if not target_ct:
+        await message.answer(f"Чат <code>{target_name}</code> не найден.", parse_mode="HTML")
+        return
+
+    if remove_route_target(route_id, target_ct['id']):
+        target_display = target_ct['ct_name'] or f"ID {target_ct['id']}"
+        await message.answer(
+            f"✅ Цель <code>{target_display}</code> убрана из маршрута {route_id}.",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(
+            f"⚠️ Чат <code>{target_name}</code> не является целью маршрута {route_id}.",
+            parse_mode="HTML"
+        )
+
 
 @commands_router.message(Command("toggle_random"), F.from_user.id == ADMIN_ID)
 async def cmd_toggle_random(message: types.Message):
@@ -1513,6 +1612,8 @@ async def set_bot_commands():
         types.BotCommand(command="import_message", description="Импортировать одно сообщение"),
         types.BotCommand(command="import_range", description="Импортировать диапазон"),
         types.BotCommand(command="skip_next", description="Пропустить публикацию"),
+        types.BotCommand(command="add_target", description="Добавить цель к маршруту"),
+        types.BotCommand(command="remove_target", description="Убрать цель из маршрута"),
         types.BotCommand(command="toggle_random", description="Вкл/выкл случайную рассылку"),
     ])
 
