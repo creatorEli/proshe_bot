@@ -28,6 +28,7 @@ from db_funcs import (
     update_route, update_chat_topic, delete_chat_topic, check_chat_topic_in_use,
     get_random_sendable_targets,
     increment_completed_rounds, deactivate_route,
+    get_next_singular_target, mark_singular_target_sent, check_singular_round_complete
 )
 
 bot = Bot(token=API_TOKEN)
@@ -263,7 +264,7 @@ async def cmd_list_chats(message: types.Message):
     text = "<b>📚 Зарегистрированные чаты и топики:</b>\n\n"
     for c in chats:
         status = "✅" if c['is_active'] else "❄️"
-        sendable = "📤" if c['ct_sendable'] else "📥"
+        sendable = "▶️" if c['ct_sendable'] else "⬇️"
         name = c['ct_name'] or "<i>без имени</i>"
 
         usage = check_chat_topic_in_use(c['id'])
@@ -277,15 +278,15 @@ async def cmd_list_chats(message: types.Message):
         topic_text = f":{c['ct_tg_topic_id']}" if c['ct_tg_topic_id'] else ""
 
         text += (
-            f"{status}{sendable} ID <code>{c['id']}</code>: <code>{name}</code>\n"
-            f"   TG: <code>{c['ct_tg_chat_id']}{topic_text}</code>\n"
+            f"{status}{sendable} ID {c['id']} : {name}\n"
+            f"   TG: {c['ct_tg_chat_id']}{topic_text}\n"
             f"   {usage_text}\n\n"
         )
 
     text += (
         "<b>Легенда:</b>\n"
         "✅ активен / ❄️ заморожен\n"
-        "📤 sendable (можно отправлять) / 📥 только источник"
+        "▶️ sendable (можно отправлять) / ⬇️ только источник"
     )
     await message.answer(text, parse_mode="HTML")
 
@@ -667,8 +668,8 @@ async def cmd_list_singular(message: types.Message):
             rounds_text = f"{completed}/{max_r}"
         
         text += (
-            f"{status} ID <code>{r['id']}</code>: {route_name}\n"
-            f"   Ист: <code>{src_name}</code>\n"
+            f"{status} ID {r['id']}: {route_name}\n"
+            f"   Ист: {src_name}\n"
             f"   Цел: {tgt_display}\n"
             f"   Круги: {rounds_text}\n"
             f"   Старт: {r['send_time']} | Интервалы: [{intervals_display}]\n\n"
@@ -962,14 +963,14 @@ async def cmd_list_routes(message: types.Message):
         tgt_names = []
         for t in targets:
             t_name = t['ct_name'] or f"ID {t['ct_id']}"
-            tgt_names.append(f"<code>{t_name}</code>")
+            tgt_names.append(f"{t_name}")
         tgt_display = ", ".join(tgt_names) if tgt_names else "нет целей"
 
         random_status = "🎲 вкл" if r['use_random_targets'] else "🎲 выкл"
 
         text += (
-            f"{status} ID <code>{r['id']}</code>: {route_name}\n"
-            f"   Ист: <code>{src_name}</code>\n"
+            f"{status} ID {r['id']}: {route_name}\n"
+            f"   Ист: {src_name}\n"
             f"   Цел: {tgt_display}\n"
             f"   Случ.расс.{random_status}\n"
             f"   Старт: {r['send_time']} | Инт-ы: [{intervals_display}]\n"
@@ -1749,6 +1750,116 @@ async def send_random_post_job(route_id: int, _attempt: int = 0, manual_send: bo
         return False
     source_chat_id = source_ct['ct_tg_chat_id']
 
+    
+    # ==========================================
+    # ЛОГИКА ДЛЯ SINGULAR (по одному целевику за раз)
+    # ==========================================
+    if route['route_mode'] == 'singular':
+        current_round = route['completed_rounds']
+        
+        # 1. Ищем целевой чат, который ещё не получал пост в этом круге
+        target = get_next_singular_target(route_id, current_round)
+        
+        if not target:
+            # Круг завершён! Все цели получили пост.
+            logging.info(f"Singular маршрут {route_id}: круг {current_round} завершён.")
+            
+            # Увеличиваем счётчик кругов
+            new_rounds = increment_completed_rounds(route_id)
+            
+            # Сбрасываем посты, чтобы они снова стали доступны для нового круга
+            reset_posts_for_route(route_id)
+            
+            # Проверяем лимит кругов
+            if route['max_rounds'] != -1 and new_rounds >= route['max_rounds']:
+                logging.info(f"Singular маршрут {route_id}: достигнут лимит {new_rounds} кругов. Деактивация.")
+                deactivate_route(route_id)
+                job_id = f"route_{route_id}"
+                if scheduler.get_job(job_id):
+                    scheduler.remove_job(job_id)
+                return False
+            
+            # Пробуем получить цель уже для нового круга
+            target = get_next_singular_target(route_id, new_rounds)
+            if not target:
+                logging.warning(f"Singular маршрут {route_id}: нет активных целей для нового круга.")
+                return False
+
+        # 2. Берём пост (если нет несентых, сбрасываем и берём снова)
+        post = get_random_unsent_post(route_id)
+        if not post:
+            reset_posts_for_route(route_id)
+            post = get_random_unsent_post(route_id)
+            
+        if not post:
+            logging.warning(f"Singular маршрут {route_id}: нет постов для отправки.")
+            return False
+
+        # 3. Отправляем пост в ОДИН выбранный целевой чат
+        target_chat_id = target['ct_tg_chat_id']
+        target_topic_id = target['ct_tg_topic_id']
+        message_ids = sorted(post['message_ids'])
+        
+        send_kwargs = {}
+        if target_topic_id:
+            send_kwargs['message_thread_id'] = target_topic_id
+
+        try:
+            if len(message_ids) > 1 and hasattr(bot, 'copy_messages'):
+                await bot.copy_messages(
+                    chat_id=target_chat_id,
+                    from_chat_id=source_chat_id,
+                    message_ids=message_ids,
+                    **send_kwargs,
+                )
+            else:
+                for msg_id in message_ids:
+                    await bot.copy_message(
+                        chat_id=target_chat_id,
+                        from_chat_id=source_chat_id,
+                        message_id=msg_id,
+                        **send_kwargs,
+                    )
+            
+            # 4. Успешно отправили: помечаем пост и цель
+            mark_post_sent(post['id'])
+            mark_singular_target_sent(route_id, target['ct_id'], current_round)
+            
+            logging.info(f"Singular: пост отправлен в {target['ct_name'] or target_chat_id} (круг {current_round})")
+            
+            # 5. Проверяем, не стал ли этот чат последним в круге
+            if check_singular_round_complete(route_id, current_round):
+                new_rounds = increment_completed_rounds(route_id)
+                reset_posts_for_route(route_id)
+                logging.info(f"Singular маршрут {route_id}: круг {current_round} полностью завершён после этой отправки.")
+                
+                if route['max_rounds'] != -1 and new_rounds >= route['max_rounds']:
+                    deactivate_route(route_id)
+                    job_id = f"route_{route_id}"
+                    if scheduler.get_job(job_id):
+                        scheduler.remove_job(job_id)
+                    logging.info(f"Singular маршрут {route_id}: достигнут максимум кругов ({new_rounds}).")
+
+            if not manual_send:
+                _schedule_next_publication(route_id, route)
+            return True
+
+        except Exception as e:
+            if is_missing_source_message_error(e):
+                logging.warning(f"Пост {post['id']} недоступен. Удаляю.")
+                delete_post(post['id'])
+                if not manual_send:
+                    return await send_random_post_job(route_id, _attempt + 1, manual_send)
+                return False
+            logging.error(f"Ошибка отправки singular маршрута {route_id}: {e}")
+            return False
+
+
+
+    # ==========================================
+    # ЛОГИКА ДЛЯ BULK (всем целям сразу, как было)
+    # ==========================================
+
     # Получаем цели 
     # TODO: подписи к постам (get_note_for_target) — пока не используем
 
@@ -1854,22 +1965,22 @@ async def send_random_post_job(route_id: int, _attempt: int = 0, manual_send: bo
 
         mark_post_sent(post['id'])
 
-        # Для singular увеличиваем счётчик кругов
-        if route['route_mode'] == 'singular':
-            new_rounds = increment_completed_rounds(route_id)
+        # # Для singular увеличиваем счётчик кругов
+        # if route['route_mode'] == 'singular':
+        #     new_rounds = increment_completed_rounds(route_id)
             
-            # Проверяем лимит
-            if route['max_rounds'] != -1 and new_rounds >= route['max_rounds']:
-                logging.info(
-                    f"Singular-маршрут {route_id}: лимит кругов достигнут "
-                    f"({new_rounds}/{route['max_rounds']})"
-                )
-                deactivate_route(route_id)
-                # Удаляем задачу из планировщика
-                job_id = f"route_{route_id}"
-                if scheduler.get_job(job_id):
-                    scheduler.remove_job(job_id)
-                    logging.info(f"Планировщик: задача {job_id} удалена (лимит достигнут)")
+        #     # Проверяем лимит
+        #     if route['max_rounds'] != -1 and new_rounds >= route['max_rounds']:
+        #         logging.info(
+        #             f"Singular-маршрут {route_id}: лимит кругов достигнут "
+        #             f"({new_rounds}/{route['max_rounds']})"
+        #         )
+        #         deactivate_route(route_id)
+        #         # Удаляем задачу из планировщика
+        #         job_id = f"route_{route_id}"
+        #         if scheduler.get_job(job_id):
+        #             scheduler.remove_job(job_id)
+        #             logging.info(f"Планировщик: задача {job_id} удалена (лимит достигнут)")
 
 
         

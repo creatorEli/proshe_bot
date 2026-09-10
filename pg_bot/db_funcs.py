@@ -52,6 +52,7 @@ def init_db():
         ct_id INTEGER NOT NULL,
         note_override TEXT DEFAULT NULL,
         is_active INTEGER DEFAULT 1,
+        last_sent_round INTEGER DEFAULT -1,
         FOREIGN KEY(route_id) REFERENCES routes(id),
         FOREIGN KEY(ct_id) REFERENCES chats_topics(id),
         UNIQUE(route_id, ct_id)
@@ -65,6 +66,7 @@ def init_db():
     )''')
     conn.commit()
     conn.close()
+
 
 def _get_conn() -> sqlite3.Connection:
     """Возвращает соединение с включёнными foreign keys и row_factory."""
@@ -344,7 +346,7 @@ def add_route_target(route_id: int, ct_id: int, note_override: str = None) -> bo
     c = conn.cursor()
     try:
         c.execute(
-            'INSERT OR IGNORE INTO route_targets (route_id, ct_id, note_override) VALUES (?, ?, ?)',
+            'INSERT OR IGNORE INTO route_targets (route_id, ct_id, note_override, last_sent_round) VALUES (?, ?, ?, -1)',
             (route_id, ct_id, note_override)
         )
         conn.commit()
@@ -557,6 +559,55 @@ def delete_chat_topic(ct_id: int) -> tuple[bool, str]:
     if deleted:
         return True, "Чат удалён."
     return False, "Чат не найден."
+
+
+def get_next_singular_target(route_id: int, current_round: int) -> Optional[sqlite3.Row]:
+    """
+    Возвращает один случайный целевой чат, который ещё не получал пост в текущем круге.
+    """
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute('''
+        SELECT rt.ct_id, ct.ct_tg_chat_id, ct.ct_tg_topic_id, ct.ct_name
+        FROM route_targets rt
+        JOIN chats_topics ct ON rt.ct_id = ct.id
+        WHERE rt.route_id = ? AND rt.is_active = 1 AND ct.is_active = 1
+          AND (rt.last_sent_round < ? OR rt.last_sent_round IS NULL)
+        ORDER BY RANDOM() LIMIT 1
+    ''', (route_id, current_round))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def mark_singular_target_sent(route_id: int, ct_id: int, current_round: int):
+    """
+    Помечает, что целевой чат получил пост в текущем круге.
+    """
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute('''
+        UPDATE route_targets 
+        SET last_sent_round = ? 
+        WHERE route_id = ? AND ct_id = ?
+    ''', (current_round, route_id, ct_id))
+    conn.commit()
+    conn.close()
+
+def check_singular_round_complete(route_id: int, current_round: int) -> bool:
+    """
+    Возвращает True, если все активные цели уже получили пост в текущем круге.
+    """
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute('''
+        SELECT 1 FROM route_targets 
+        WHERE route_id = ? AND is_active = 1 
+          AND (last_sent_round < ? OR last_sent_round IS NULL)
+        LIMIT 1
+    ''', (route_id, current_round))
+    row = c.fetchone()
+    conn.close()
+    return row is None  # True, если строк не найдено (все получили)
 
 
 # ============================================================
