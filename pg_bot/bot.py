@@ -155,30 +155,33 @@ def _recalculate_and_reschedule(route_id: int, route):
     if not intervals or not send_time:
         return
     
-    # Вычисляем новое время запуска
-    start_date = _calculate_initial_start(send_time)
+    # Плановое время запуска (БЕЗ джиттера)
+    planned_start = _calculate_initial_start(send_time)
 
+    # Сохраняем в БД ПЛАНОВОЕ время
+    update_route_schedule(route_id, 0, planned_start.isoformat())
+
+    # Фактический запуск = плановое + джиттер
+    actual_start = planned_start
     jitter = route['jitter_seconds'] or 0
     if jitter > 0:
-        start_date += timedelta(seconds=random.randint(0, jitter))
+        actual_start += timedelta(seconds=random.randint(0, jitter))
 
-    # Обновляем расписание в БД
-    update_route_schedule(route_id, 0, start_date.isoformat())
-
-    # Обновляем задачу в планировщике
     job_id = f"route_{route_id}"
     scheduler.add_job(
         send_random_post_job,
         trigger='date',
-        run_date=start_date,
+        run_date=actual_start,  # <-- с джиттером
         args=[route_id],
         id=job_id,
         replace_existing=True,
         misfire_grace_time=300,
         coalesce=True,
     )
-    logging.info(f"Маршрут {route_id}: расписание обновлено, следующий запуск {start_date}")
-
+    logging.info(
+        f"Маршрут {route_id}: расписание обновлено, "
+        f"плановое {planned_start}, фактический запуск {actual_start}"
+    )
 
 # ==========================================
 # КОМАНДЫ УПРАВЛЕНИЯ ЧАТАМИ
@@ -2014,19 +2017,37 @@ def _schedule_next_publication(route_id: int, route):
     next_index = (current_index + 1) % len(intervals)
 
     tz = ZoneInfo(TIMEZONE)
-    next_run = datetime.now(tz) + timedelta(seconds=interval_seconds)
+
+
+    # Берём ПЛАНОВОЕ время из БД (в нём нет джиттера)
+    saved_next_run = route['next_run_time']
+    if saved_next_run:
+        try:
+            base_planned = datetime.fromisoformat(saved_next_run)
+        except ValueError:
+            base_planned = datetime.now(tz)
+    else:
+        base_planned = datetime.now(tz)
+
+    # Плановое время следующего запуска = базовое + интервал (СТРОГО, без джиттера)
+    next_planned = base_planned + timedelta(seconds=interval_seconds)
+
+    # Сохраняем в БД именно ПЛАНОВОЕ время (без джиттера)
+    update_route_schedule(route_id, next_index, next_planned.isoformat())
+
+    # Фактическое время запуска = плановое + джиттер
+    actual_run = next_planned
 
     jitter = route['jitter_seconds'] or 0
     if jitter > 0:
-        next_run += timedelta(seconds=random.randint(0, jitter))
+        actual_run += timedelta(seconds=random.randint(0, jitter))
 
-    update_route_schedule(route_id, next_index, next_run.isoformat())
 
     job_id = f"route_{route_id}"
     scheduler.add_job(
         send_random_post_job,
         trigger='date',
-        run_date=next_run,
+        run_date=actual_run,  # <-- с джиттером
         args=[route_id],
         id=job_id,
         replace_existing=True,
@@ -2034,7 +2055,9 @@ def _schedule_next_publication(route_id: int, route):
         coalesce=True,
     )
     logging.info(
-        f"Маршрут {route_id}: следующий пост через {format_interval(interval_seconds)}, в {next_run}"
+        f"Маршрут {route_id}: плановое время {next_planned}, "
+        f"фактический запуск {actual_run} "
+        f"(через {format_interval(interval_seconds)})"
     )
 
 
@@ -2059,47 +2082,46 @@ def schedule_route_job(route):
     saved_next_run = route['next_run_time']
     if saved_next_run:
         try:
-            start_date = datetime.fromisoformat(saved_next_run)
-            if start_date <= now:
+            planned_start = datetime.fromisoformat(saved_next_run)
+            if planned_start <= now:
                 logging.warning(
-                    f"Маршрут {route_id}: next_run_time {start_date} в прошлом "
-                    f"(сейчас {now}). Пересчитываю расписание от текущего момента."
+                    f"Маршрут {route_id}: плановое время {planned_start} в прошлом. "
+                    f"Пересчитываю от текущего момента."
                 )
-                # Берём текущий интервал и откладываем от "сейчас"
                 current_index = route['interval_index'] or 0
                 interval_seconds = intervals[current_index]
-                start_date = now + timedelta(seconds=interval_seconds)
+                planned_start = now + timedelta(seconds=interval_seconds)
             else:
-                logging.info(f"Маршрут {route_id}: восстановлен next_run_time = {start_date}")
+                logging.info(f"Маршрут {route_id}: восстановлено плановое время = {planned_start}")
         except ValueError:
-            start_date = _calculate_initial_start(send_time)
+            planned_start = _calculate_initial_start(send_time)
     else:
-        start_date = _calculate_initial_start(send_time)
-        logging.info(f"Маршрут {route_id}: первый запуск, start_date = {start_date}")
+        planned_start = _calculate_initial_start(send_time)
+        logging.info(f"Маршрут {route_id}: первый запуск, плановое время = {planned_start}")
 
+    # Сохраняем в БД ПЛАНОВОЕ время (БЕЗ джиттера)
+    update_route_schedule(route_id, route['interval_index'] or 0, planned_start.isoformat())
+
+    # Фактический запуск = плановое + джиттер
+    actual_start = planned_start
     jitter = route['jitter_seconds'] or 0
     if jitter > 0:
-        start_date += timedelta(seconds=random.randint(0, jitter))
-    
-    # Обновляем next_run_time в БД, чтобы после рестарта не было рассинхрона
-    update_route_schedule(route_id, route['interval_index'] or 0, start_date.isoformat())
+        actual_start += timedelta(seconds=random.randint(0, jitter))
 
-    
     scheduler.add_job(
         send_random_post_job,
         trigger='date',
-        run_date=start_date,
+        run_date=actual_start,  # <-- с джиттером
         args=[route_id],
         id=job_id,
         replace_existing=True,
         misfire_grace_time=300,
         coalesce=True,
     )
-
     intervals_display = ', '.join(format_interval(i) for i in intervals)
     logging.info(
-        f"Загружен маршрут {route_id}: старт {start_date}, "
-        f"интервалы [{intervals_display}]"
+        f"Загружен маршрут {route_id}: плановое {planned_start}, "
+        f"фактический старт {actual_start}, интервалы [{intervals_display}]"
     )
 
 
