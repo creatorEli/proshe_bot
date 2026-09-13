@@ -19,6 +19,7 @@ HELP_TEXT = (
     "<code>/add_route &lt;имя_исх&gt; &lt;имя_цели&gt;</code> — пошаговое добавление\n"
     "<code>/add_route &lt;имя_исх&gt; &lt;имя_цели&gt; &lt;ЧЧ:ММ&gt; &lt;интервалы&gt;</code> — однострочное\n"
     "<code>/send_now &lt;ID&gt;</code> — отправить пост сейчас\n"
+    "<code>/rename_route &lt;ID&gt; &lt;новое_название&gt;</code> — переименовать маршрут\n"    
     "<code>/delete_route &lt;ID&gt;</code> — удалить маршрут\n"
     "<code>/freeze_route &lt;ID&gt;</code> — заморозить маршрут\n"
     "<code>/unfreeze_route &lt;ID&gt;</code> — разморозить маршрут\n"

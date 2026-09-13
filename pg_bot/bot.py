@@ -74,6 +74,7 @@ async def set_bot_commands():
         types.BotCommand(command="help", description="Справка"),
         types.BotCommand(command="routes", description="Список маршрутов"),
         types.BotCommand(command="add_route", description="Добавить маршрут"),
+        types.BotCommand(command="rename_route", description="Переименовать маршрут"),
         types.BotCommand(command="send_now", description="Отправить пост сейчас"),
         types.BotCommand(command="delete_route", description="Удалить маршрут"),
         types.BotCommand(command="freeze_route", description="Заморозить маршрут"),

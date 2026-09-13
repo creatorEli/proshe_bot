@@ -882,3 +882,49 @@ async def cmd_skip_next(message: types.Message):
     else:
         await message.answer(f"Не удалось пропустить публикацию для маршрута {route_id}.")
 
+@commands_router.message(Command("rename_route"), F.from_user.id == ADMIN_ID)
+async def cmd_rename_route(message: types.Message):
+    """Переименовывает маршрут (работает и для bulk, и для singular)."""
+    if not message.text:
+        return
+    
+    # maxsplit=2, чтобы название с пробелами попало целиком в args[2]
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        await message.answer(
+            "<b>Формат:</b>\n"
+            "<code>/rename_route &lt;ID маршрута&gt; &lt;новое название&gt;</code>\n\n"
+            "<b>Примеры:</b>\n"
+            "<code>/rename_route 5 Реклама партнёров</code>\n"
+            "<code>/rename_route 3 Основной постинг</code>",
+            parse_mode="HTML"
+        )
+        return
+    
+    try:
+        route_id = int(args[1])
+        new_name = args[2].strip()
+    except ValueError:
+        await message.answer("ID маршрута должен быть числом.")
+        return
+    
+    if not new_name:
+        await message.answer("Название не может быть пустым.")
+        return
+    
+    route = get_route_by_id(route_id)
+    if not route:
+        await message.answer(f"Маршрут {route_id} не найден.")
+        return
+    
+    old_name = route['route_name'] or f"Маршрут {route_id}"
+    
+    if update_route(route_id, route_name=new_name):
+        await message.answer(
+            f"✅ Маршрут <code>{route_id}</code> переименован!\n\n"
+            f"🔹 Было: <code>{old_name}</code>\n"
+            f"🔹 Стало: <code>{new_name}</code>",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(f"Не удалось переименовать маршрут {route_id}.")
