@@ -24,7 +24,7 @@ from db_funcs import (
     get_route_by_id,
 )
 
-from pg_bot.scheduler_utils import schedule_route_job
+from scheduler_utils import schedule_route_job
 
 from state_store import (
     AddRouteStates,
@@ -152,6 +152,11 @@ async def route_step_jitter(message: types.Message, state: FSMContext):
     )
 
     # Привязываем цель (пока одна; TODO: множественные цели)
+
+    if route_id is None:
+        await message.answer("❌ Ошибка: не удалось присвоить разброс маршруту в базе данных")
+        return
+
     add_route_target(route_id, data['target_ct_id'])
 
     route = get_route_by_id(route_id)

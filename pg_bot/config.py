@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+from typing import Optional
 
 # Путь к папке проекта
 BASE_DIR = Path(__file__).resolve().parent
@@ -9,7 +10,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 
-def get_env(name: str, default: str = None) -> str:
+def get_env(name: str, default: Optional[str] = None) -> str:
     value = os.getenv(name, default)
 
     if value is None:
@@ -21,7 +22,7 @@ def get_env(name: str, default: str = None) -> str:
     return value
 
 
-def get_int_env(name: str, default: int = None) -> int:
+def get_int_env(name: str, default: Optional[int] = None) -> int:
     value = os.getenv(name)
 
     if value is None:

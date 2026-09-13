@@ -1,6 +1,7 @@
 # handlers/imports.py
 
 import asyncio
+import json
 import logging
 
 from aiogram import Router, types, F
@@ -9,8 +10,10 @@ from aiogram.filters import Command
 from config import ADMIN_ID, MAIN_SOURCE_CHAT_ID
 from db_funcs import (
     get_chat_topic_by_id,
+    get_last_post_id,
     get_route_by_id,
     save_post,
+    update_post_buttons,
 )
 
 from state_store import (
@@ -202,3 +205,69 @@ async def cmd_import_range(message: types.Message):
     )
 
 
+@commands_router.message(Command("add_buttons"), F.from_user.id == ADMIN_ID)
+async def cmd_add_buttons(message: types.Message):
+    """
+    Добавляет inline-кнопки к последнему импортированному посту.
+    Формат: /add_buttons <ID маршрута> <Текст1|URL1, Текст2|URL2>
+    Пример: /add_buttons 5 Канал|https://t.me/channel, Сайт|https://example.com
+    """
+    if not message.text:
+        return
+    
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        await message.answer(
+            "<b>Формат:</b>\n"
+            "<code>/add_buttons &lt;ID маршрута&gt; &lt;Текст1|URL1, Текст2|URL2&gt;</code>\n\n"
+            "<b>Примеры:</b>\n"
+            "<code>/add_buttons 5 Канал|https://t.me/channel, Сайт|https://example.com</code>\n"
+            "<code>/add_buttons 5 Кнопка1|https://link1.com</code>\n\n"
+            "Кнопки будут добавлены к <b>последнему импортированному посту</b> в маршруте.",
+            parse_mode="HTML"
+        )
+        return
+    
+    try:
+        route_id = int(args[1])
+        buttons_str = args[2].strip()
+    except ValueError:
+        await message.answer("ID маршрута должен быть числом.")
+        return
+    
+    route = get_route_by_id(route_id)
+    if not route:
+        await message.answer(f"Маршрут {route_id} не найден.")
+        return
+    
+    # Парсим кнопки
+    buttons_list = []
+    try:
+        pairs = [p.strip() for p in buttons_str.split(',')]
+        for pair in pairs:
+            if '|' in pair:
+                text, url = pair.split('|', 1)
+                if text.strip() and url.strip():
+                    buttons_list.append({"text": text.strip(), "url": url.strip()})
+        
+        if not buttons_list:
+            raise ValueError("Неверный формат кнопок")
+    except Exception as e:
+        await message.answer(f"Ошибка в формате кнопок: {e}")
+        return
+    
+    # Находим последний пост в маршруте
+    last_post_id = get_last_post_id(route_id)
+    if not last_post_id:
+        await message.answer(f"В маршруте {route_id} нет постов. Сначала импортируй пост.")
+        return
+    
+    # Сохраняем кнопки
+    buttons_json = json.dumps(buttons_list)
+    if update_post_buttons(last_post_id, buttons_json):
+        await message.answer(
+            f"✅ Добавлено {len(buttons_list)} кнопок к последнему посту маршрута {route_id}:\n"
+            + "\n".join([f"  • {btn['text']}: {btn['url']}" for btn in buttons_list])
+        )
+    else:
+        await message.answer("Не удалось обновить кнопки.")

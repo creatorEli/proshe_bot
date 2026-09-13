@@ -29,7 +29,7 @@ from state_store import (
     AddRouteStates
 )
 
-from pg_bot.scheduler_utils import (
+from scheduler_utils import (
     recalculate_and_reschedule,
     schedule_route_job
 )
@@ -89,6 +89,11 @@ async def cmd_add_singular(message: types.Message):
             jitter_seconds=0,
             max_rounds=max_rounds,
         )
+
+        # Явная проверка на None удовлетворяет type checker и предотвращает ошибки БД
+        if route_id is None:
+            await message.answer("❌ Ошибка: не удалось создать маршрут в базе данных.")
+            return
         
         route = get_route_by_id(route_id)
         schedule_route_job(route)
@@ -102,7 +107,8 @@ async def cmd_add_singular(message: types.Message):
             f"Первый пост в {send_time}\n"
             f"Интервалы: [{intervals_display}]\n"
             f"Кругов: {rounds_text}\n\n"
-            f"Теперь добавь цели через /add_target {route_id} &lt;имя_чата&gt;",
+            f"Теперь добавь цели через <code>/add_target {route_id}</code> &lt;имя_чата&gt;\n"
+            f"Пост для рассылки через <code>/import_singular {route_id}</code> - переслать в исходный чат после активации режима импорта\n",
             parse_mode="HTML"
         )
         

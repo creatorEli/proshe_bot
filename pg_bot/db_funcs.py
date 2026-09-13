@@ -65,6 +65,15 @@ def init_db():
         FOREIGN KEY(route_id) REFERENCES routes(id)
     )''')
     conn.commit()
+
+    # === МИГРАЦИЯ: добавляем buttons_json в posts ===
+    try:
+        c.execute("ALTER TABLE posts ADD COLUMN buttons_json TEXT DEFAULT NULL")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Колонка уже существует
+    
+
     conn.close()
 
 
@@ -162,10 +171,10 @@ def update_chat_topic(ct_id: int, **kwargs) -> bool:
 # routes
 # ============================================================
 
-def add_route(source_ct_id: int, route_name: str = None,
-              route_mode: str = 'bulk', send_time: str = None,
+def add_route(source_ct_id: int, route_name: Optional[str] = None,
+              route_mode: str = 'bulk', send_time: Optional[str] = None,
               intervals_json: str = '[]', jitter_seconds: int = 0,
-              max_rounds: int = -1, use_random_targets: bool = False) -> int:
+              max_rounds: int = -1, use_random_targets: bool = False) -> int | None:
     conn = _get_conn()
     c = conn.cursor()
     c.execute(
@@ -180,6 +189,11 @@ def add_route(source_ct_id: int, route_name: str = None,
     conn.commit()
     route_id = c.lastrowid
     conn.close()
+
+    # Явно обрабатываем случай, если lastrowid вдруг вернет None
+    if route_id is None:
+        raise ValueError("Не удалось получить ID новой записи (lastrowid is None)")
+       
     return route_id
 
 def get_route_by_id(route_id: int) -> Optional[sqlite3.Row]:
@@ -340,7 +354,7 @@ def skip_next_publication(route_id: int):
 # route_targets
 # ============================================================
 
-def add_route_target(route_id: int, ct_id: int, note_override: str = None) -> bool:  # type: ignore
+def add_route_target(route_id: int, ct_id: int, note_override: str | None = None) -> bool:
     """Добавляет цель маршруту. Возвращает False, если связь уже есть."""
     conn = _get_conn()
     c = conn.cursor()
@@ -411,7 +425,7 @@ def get_note_for_target(route_id: int, ct_id: int) -> Optional[str]:
 # posts
 # ============================================================
 
-def save_post(route_id: int, message_ids_list: list[int]) -> bool:
+def save_post(route_id: int, message_ids_list: list[int], buttons_json: Optional[str] = None) -> bool:
     """Сохраняет пост (список message_id). Возвращает False если дубликат."""
     if not message_ids_list:
         return False
@@ -419,16 +433,19 @@ def save_post(route_id: int, message_ids_list: list[int]) -> bool:
     message_ids_json = json.dumps(message_ids_list)
     conn = _get_conn()
     c = conn.cursor()
+
     c.execute(
         'SELECT id FROM posts WHERE route_id = ? AND message_ids = ?',
         (route_id, message_ids_json)
     )
+
     if c.fetchone():
         conn.close()
         return False
+    
     c.execute(
-        'INSERT INTO posts (route_id, message_ids, is_sent) VALUES (?, ?, 0)',
-        (route_id, message_ids_json)
+        'INSERT INTO posts (route_id, message_ids, is_sent, buttons_json) VALUES (?, ?, 0, ?)',
+        (route_id, message_ids_json, buttons_json)
     )
     conn.commit()
     conn.close()
@@ -438,7 +455,7 @@ def get_random_unsent_post(route_id: int) -> Optional[dict]:
     conn = _get_conn()
     c = conn.cursor()
     c.execute(
-        'SELECT id, message_ids FROM posts WHERE route_id = ? AND is_sent = 0',
+        'SELECT id, message_ids, buttons_json FROM posts WHERE route_id = ? AND is_sent = 0',
         (route_id,)
     )
     posts = c.fetchall()
@@ -450,7 +467,11 @@ def get_random_unsent_post(route_id: int) -> Optional[dict]:
         message_ids = json.loads(post['message_ids'])
     except Exception:
         message_ids = []
-    return {'id': post['id'], 'message_ids': message_ids}
+    return {
+        'id': post['id'], 
+        'message_ids': message_ids,
+        'buttons_json': post['buttons_json']
+    }
 
 def mark_post_sent(post_id: int):
     conn = _get_conn()
@@ -674,3 +695,49 @@ def get_routes_for_source(tg_chat_id: int, tg_topic_id: int = 0) -> list[sqlite3
     rows = c.fetchall()
     conn.close()
     return rows
+
+
+# работа с кнопками под постом
+
+def update_post_buttons(post_id: int, new_buttons_json: str) -> bool:
+    """Обновляет кнопки у существующего поста."""
+    conn = _get_conn()
+    c = conn.cursor()
+    # 1. Читаем текущие кнопки
+    c.execute('SELECT buttons_json FROM posts WHERE id = ?', (post_id,))
+    row = c.fetchone()
+    
+    current_buttons = []
+    if row and row['buttons_json']:
+        try:
+            current_buttons = json.loads(row['buttons_json'])
+        except Exception:
+            current_buttons = []
+            
+    # 2. Парсим новые и объединяем списки
+    try:
+        new_buttons = json.loads(new_buttons_json)
+        current_buttons.extend(new_buttons)
+    except Exception:
+        conn.close()
+        return False
+        
+    # 3. Сохраняем обновленный список
+    final_json = json.dumps(current_buttons)
+    c.execute('UPDATE posts SET buttons_json = ? WHERE id = ?', (final_json, post_id))
+    conn.commit()
+    updated = c.rowcount > 0
+    conn.close()
+    return updated
+
+def get_last_post_id(route_id: int) -> Optional[int]:
+    """Возвращает ID последнего добавленного поста в маршруте."""
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute(
+        'SELECT id FROM posts WHERE route_id = ? ORDER BY id DESC LIMIT 1',
+        (route_id,)
+    )
+    row = c.fetchone()
+    conn.close()
+    return row['id'] if row else None

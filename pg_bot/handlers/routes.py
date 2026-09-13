@@ -42,7 +42,7 @@ from state_store import (
     AddRouteStates
 )
 
-from pg_bot.scheduler_utils import (
+from scheduler_utils import (
     recalculate_and_reschedule,
     schedule_route_job,
     send_random_post_job
@@ -132,6 +132,12 @@ async def cmd_add_route(message: types.Message, state: FSMContext):
                 jitter_seconds=0,
                 max_rounds=-1,
             )
+
+            # Явная проверка на None удовлетворяет type checker и предотвращает ошибки БД
+            if route_id is None:
+                await message.answer("❌ Ошибка: не удалось создать маршрут в базе данных.")
+                return
+            
             add_route_target(route_id, target_ct['id'])
 
             route = get_route_by_id(route_id)
