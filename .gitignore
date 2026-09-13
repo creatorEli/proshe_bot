@@ -9,6 +9,7 @@ config~
 # Старый код
 prev/
 
+
 # Python
 __pycache__/
 *.py[cod]
