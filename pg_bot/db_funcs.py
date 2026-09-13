@@ -62,18 +62,10 @@ def init_db():
         route_id INTEGER,
         message_ids TEXT,
         is_sent INTEGER DEFAULT 0,
+        buttons_json TEXT DEFAULT NULL,
         FOREIGN KEY(route_id) REFERENCES routes(id)
     )''')
     conn.commit()
-
-    # === МИГРАЦИЯ: добавляем buttons_json в posts ===
-    try:
-        c.execute("ALTER TABLE posts ADD COLUMN buttons_json TEXT DEFAULT NULL")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # Колонка уже существует
-    
-
     conn.close()
 
 
