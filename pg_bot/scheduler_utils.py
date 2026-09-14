@@ -361,9 +361,9 @@ def schedule_route_job(route):
             else:
                 logging.info(f"Маршрут {route_id}: восстановлено плановое время = {planned_start}")
         except ValueError:
-            planned_start = _calculate_initial_start(send_time)
+            planned_start = _find_next_slot_from_anchor(send_time, intervals, now)
     else:
-        planned_start = _calculate_initial_start(send_time)
+        planned_start = _find_next_slot_from_anchor(send_time, intervals, now)
         logging.info(f"Маршрут {route_id}: первый запуск, плановое время = {planned_start}")
 
     # Сохраняем в БД ПЛАНОВОЕ время (БЕЗ джиттера)
