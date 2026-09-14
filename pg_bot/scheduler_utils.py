@@ -193,138 +193,6 @@ async def _execute_singular_send(route, source_chat_id: int, post: dict, message
     return True
 
 
-# async def _execute_singular_send(route, source_chat_id: int, post: dict, message_ids: list, manual_send: bool) -> bool:
-#     """Логика отправки для singular-маршрутов (по одной цели за тик)."""
-#     route_id = route['id']
-#     current_round = route['completed_rounds']
-    
-#     # 1. Находим цель, которая ещё не получала пост в ТЕКУЩЕМ круге
-#     target = get_next_singular_target(route_id, current_round)
-    
-#     if not target:
-#         # Круг завершён! Сбрасываем посты и переходим к следующему кругу
-#         logging.info(f"Singular {route_id}: круг {current_round} завершён. Сброс постов.")
-#         reset_posts_for_route(route_id)
-        
-#         new_rounds = increment_completed_rounds(route_id)
-        
-#         # Проверка лимита кругов
-#         if route['max_rounds'] != -1 and new_rounds >= route['max_rounds']:
-#             logging.info(f"Singular {route_id}: достигнут лимит {new_rounds} кругов. Деактивация.")
-#             deactivate_route(route_id)
-#             job_id = f"route_{route_id}"
-#             if scheduler.get_job(job_id):
-#                 scheduler.remove_job(job_id)
-#             return False
-            
-#         # Ищем цель уже для нового круга
-#         target = get_next_singular_target(route_id, new_rounds)
-#         if not target:
-#             logging.warning(f"Singular {route_id}: нет активных целей для нового круга {new_rounds}.")
-#             return False
-#         # Обновляем current_round для корректной пометки цели
-#         current_round = new_rounds
-
-#     # Отправляем пост в ОДНУ выбранную цель
-#     target_chat_id = target['ct_tg_chat_id']
-#     target_topic_id = target['ct_tg_topic_id']
-    
-#     send_kwargs = {'message_thread_id': target_topic_id} if target_topic_id else {}
-
-#     # 1. Заранее парсим кнопки, но НЕ добавляем их в send_kwargs
-#     markup = None
-#     if post.get('buttons_json'):
-        
-#         try:
-#             buttons_data = json.loads(post['buttons_json'])
-#             keyboard = [[types.InlineKeyboardButton(text=btn['text'], url=btn['url'])] for btn in buttons_data]
-#             markup = types.InlineKeyboardMarkup(inline_keyboard=keyboard)
-#         except Exception as e:
-#             logging.warning(f"Ошибка парсинга кнопок для поста {post['id']}: {e}")
-
-#     # 2. Копируем сообщения БЕЗ reply_markup
-#     if len(message_ids) > 1 and hasattr(bot, 'copy_messages'):
-#         # copy_messages возвращает список объектов MessageId
-#         copied_msgs = await bot.copy_messages(
-#             chat_id=target_chat_id, 
-#             from_chat_id=source_chat_id, 
-#             message_ids=message_ids, 
-#             **send_kwargs
-#         )
-        
-#         # Если есть кнопки, добавляем их к ПОСЛЕДНЕМУ сообщению в альбоме
-#         if markup and copied_msgs:
-#             if len(message_ids) > 1:
-#                 last_msg_id = copied_msgs[-1].message_id
-                
-#                 try:    
-#                     await bot.edit_message_reply_markup(
-#                         chat_id=target_chat_id,
-#                         message_id=last_msg_id,
-#                         reply_markup=markup
-#                     )
-
-#                 except TelegramBadRequest as e:
-#                     if "message is not modified" in str(e):
-#                         # Кнопки уже на месте, игнорируем ошибку
-#                         pass 
-#                     else:
-#                         logging.warning(f"Не удалось добавить кнопки: {e}")
-
-#                 except Exception as e:
-#                     logging.warning(f"Не удалось добавить кнопки к скопированному альбому {post['id']}: {e}")
-
-#             elif len(message_ids) == 1:
-#                 await bot.copy_message(
-#                     chat_id=target_chat_id,
-#                     from_chat_id=source_chat_id,
-#                     message_id=message_ids[0],
-#                     reply_markup=markup, # Кнопки применятся сразу при копировании
-#                     **send_kwargs
-#                 )
-                
-#     else:
-#         for msg_id in message_ids:
-#             # copy_message возвращает объект MessageId
-#             copied_msg = await bot.copy_message(
-#                 chat_id=target_chat_id, 
-#                 from_chat_id=source_chat_id, 
-#                 message_id=msg_id, 
-#                 **send_kwargs
-#             )
-            
-#             # Если есть кнопки, редактируем скопированное сообщение
-#             if markup and copied_msg:
-#                 try:
-#                     await bot.edit_message_reply_markup(
-#                         chat_id=target_chat_id,
-#                         message_id=copied_msg.message_id,
-#                         reply_markup=markup
-#                     )
-#                 except Exception as e:
-#                     logging.warning(f"Не удалось добавить кнопки к сообщению {msg_id}: {e}")
-
-
-#     # if len(message_ids) > 1 and hasattr(bot, 'copy_messages'):
-#     #     await bot.copy_messages(chat_id=target_chat_id, from_chat_id=source_chat_id, message_ids=message_ids, **send_kwargs)
-#     # else:
-#     #     for msg_id in message_ids:
-#     #         await bot.copy_message(chat_id=target_chat_id, from_chat_id=source_chat_id, message_id=msg_id, **send_kwargs)
-
-#     # 3. Помечаем пост и цель как отправленные
-#     mark_post_sent(post['id'])
-#     mark_singular_target_sent(route_id, target['ct_id'], current_round)
-#     logging.info(f"Singular: пост {post['id']} отправлен в {target['ct_name'] or target_chat_id} (круг {current_round})")
-
-#     # 4. Проверяем, не стал ли этот чат последним в круге (опционально, для мгновенной реакции)
-#     if check_singular_round_complete(route_id, current_round):
-#         logging.info(f"Singular {route_id}: круг {current_round} полностью завершён после этой отправки.")
-#         # Сброс и инкремент произойдут при следующем тике, когда get_next_singular_target вернёт None.
-#         # Это предотвращает двойной инкремент в одном тике.
-
-#     return True
-
-
 async def _execute_bulk_send(route, source_chat_id: int, post: dict, message_ids: list, manual_send: bool) -> bool:
     """Логика отправки для bulk-маршрутов (во все цели сразу)."""
     route_id = route['id']
@@ -336,20 +204,9 @@ async def _execute_bulk_send(route, source_chat_id: int, post: dict, message_ids
         return False
 
     guaranteed_ct_ids = []
-
-    # === ПОДГОТОВКА КНОПОК (одинаковые для всех целей в bulk) ===
-    # send_kwargs_base = {}
-    # if post.get('buttons_json'):
-    #     try:
-    #         buttons_data = json.loads(post['buttons_json'])
-    #         keyboard = [[types.InlineKeyboardButton(text=btn['text'], url=btn['url'])] for btn in buttons_data]
-    #         send_kwargs_base['reply_markup'] = types.InlineKeyboardMarkup(inline_keyboard=keyboard)
-    #     except Exception as e:
-    #         logging.warning(f"Ошибка парсинга кнопок для поста {post['id']}: {e}")
-
     
     # 2. Отправляем во все гарантированные цели С ЗАДЕРЖКОЙ
-    for i, target in targets:
+    for i, target in enumerate(targets):
         target_chat_id = target['ct_tg_chat_id']
         target_topic_id = target['ct_tg_topic_id']
         guaranteed_ct_ids.append(target['ct_id'])
