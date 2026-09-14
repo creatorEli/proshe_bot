@@ -13,7 +13,12 @@ from db_funcs import (
     get_last_post_id,
     get_route_by_id,
     save_post,
-    update_post_buttons,
+    update_post_buttons, 
+    get_posts_for_route, 
+    clear_post_buttons, 
+    remove_post_button, 
+    _get_conn
+
 )
 
 from state_store import (
@@ -208,9 +213,8 @@ async def cmd_import_range(message: types.Message):
 @commands_router.message(Command("add_buttons"), F.from_user.id == ADMIN_ID)
 async def cmd_add_buttons(message: types.Message):
     """
-    Добавляет inline-кнопки к последнему импортированному посту.
-    Формат: /add_buttons <ID маршрута> <Текст1|URL1, Текст2|URL2>
-    Пример: /add_buttons 5 Канал|https://t.me/channel, Сайт|https://example.com
+    Добавляет inline-кнопки к посту.
+    Формат: /add_buttons <ID маршрута ИЛИ ID поста> <Текст1|URL1, Текст2|URL2>
     """
     if not message.text:
         return
@@ -219,27 +223,45 @@ async def cmd_add_buttons(message: types.Message):
     if len(args) < 3:
         await message.answer(
             "<b>Формат:</b>\n"
-            "<code>/add_buttons &lt;ID маршрута&gt; &lt;Текст1|URL1, Текст2|URL2&gt;</code>\n\n"
+            "<code>/add_buttons &lt;ID маршрута или ID поста&gt; &lt;Текст1|URL1, Текст2|URL2&gt;</code>\n\n"
             "<b>Примеры:</b>\n"
-            "<code>/add_buttons 5 Канал|https://t.me/channel, Сайт|https://example.com</code>\n"
-            "<code>/add_buttons 5 Кнопка1|https://link1.com</code>\n\n"
-            "Кнопки будут добавлены к <b>последнему импортированному посту</b> в маршруте.",
+            "<code>/add_buttons 5 Канал|https://t.me/channel</code> (к последнему посту маршрута 5)\n"
+            "<code>/add_buttons 123 Сайт|https://example.com</code> (к конкретному посту 123)\n\n"
+            "ID постов можно посмотреть через <code>/posts &lt;ID маршрута&gt;</code>",
             parse_mode="HTML"
         )
         return
     
     try:
-        route_id = int(args[1])
+        target_id = int(args[1])
         buttons_str = args[2].strip()
     except ValueError:
-        await message.answer("ID маршрута должен быть числом.")
+        await message.answer("ID должен быть числом.")
         return
     
-    route = get_route_by_id(route_id)
-    if not route:
-        await message.answer(f"Маршрут {route_id} не найден.")
-        return
+    # Определяем, что именно нам передали: ID поста или ID маршрута
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute('SELECT id, route_id FROM posts WHERE id = ?', (target_id,))
+    post_row = c.fetchone()
+    conn.close()
     
+    if post_row:
+        # Передали ID конкретного поста
+        post_id = post_row['id']
+        route_id = post_row['route_id']
+    else:
+        # Передали ID маршрута, ищем последний пост
+        route_id = target_id
+        route = get_route_by_id(route_id)
+        if not route:
+            await message.answer(f"Маршрут {route_id} не найден (и поста с таким ID тоже нет).")
+            return
+        post_id = get_last_post_id(route_id)
+        if not post_id:
+            await message.answer(f"В маршруте {route_id} нет постов. Сначала импортируй пост.")
+            return
+
     # Парсим кнопки
     buttons_list = []
     try:
@@ -256,18 +278,59 @@ async def cmd_add_buttons(message: types.Message):
         await message.answer(f"Ошибка в формате кнопок: {e}")
         return
     
-    # Находим последний пост в маршруте
-    last_post_id = get_last_post_id(route_id)
-    if not last_post_id:
-        await message.answer(f"В маршруте {route_id} нет постов. Сначала импортируй пост.")
-        return
-    
     # Сохраняем кнопки
     buttons_json = json.dumps(buttons_list)
-    if update_post_buttons(last_post_id, buttons_json):
+    if update_post_buttons(post_id, buttons_json):
         await message.answer(
-            f"✅ Добавлено {len(buttons_list)} кнопок к последнему посту маршрута {route_id}:\n"
-            + "\n".join([f"  • {btn['text']}: {btn['url']}" for btn in buttons_list])
+            f"✅ Добавлено {len(buttons_list)} кнопок к посту <code>{post_id}</code> (маршрут {route_id}):\n"
+            + "\n".join([f"  • {btn['text']}: {btn['url']}" for btn in buttons_list]),
+            parse_mode="HTML"
         )
     else:
         await message.answer("Не удалось обновить кнопки.")
+
+
+@commands_router.message(Command("clear_buttons"), F.from_user.id == ADMIN_ID)
+async def cmd_clear_buttons(message: types.Message):
+    """Полностью очищает кнопки у поста."""
+    if not message.text: return
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Формат: <code>/clear_buttons &lt;ID поста&gt;</code>", parse_mode="HTML")
+        return
+    try:
+        post_id = int(args[1])
+    except ValueError:
+        await message.answer("ID поста должен быть числом.")
+        return
+        
+    if clear_post_buttons(post_id):
+        await message.answer(f"✅ Все кнопки успешно удалены у поста <code>{post_id}</code>.", parse_mode="HTML")
+    else:
+        await message.answer(f"❌ Пост <code>{post_id}</code> не найден.", parse_mode="HTML")
+
+
+@commands_router.message(Command("del_button"), F.from_user.id == ADMIN_ID)
+async def cmd_del_button(message: types.Message):
+    """Удаляет конкретную кнопку по её номеру из списка."""
+    if not message.text: return
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer(
+            "Формат: <code>/del_button &lt;ID поста&gt; &lt;номер&gt;</code>\n"
+            "Номер кнопки можно посмотреть в <code>/posts &lt;ID маршрута&gt;</code>", 
+            parse_mode="HTML"
+        )
+        return
+    try:
+        post_id = int(args[1])
+        index = int(args[2])
+    except ValueError:
+        await message.answer("ID поста и номер кнопки должны быть числами.")
+        return
+        
+    success, msg = remove_post_button(post_id, index)
+    if success:
+        await message.answer(f"✅ {msg}", parse_mode="HTML")
+    else:
+        await message.answer(f"❌ {msg}", parse_mode="HTML")

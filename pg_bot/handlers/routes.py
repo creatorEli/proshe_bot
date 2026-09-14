@@ -24,7 +24,8 @@ from db_funcs import (
     get_all_chat_topics,
     get_all_routes,
     get_chat_topic_by_id, 
-    get_chat_topic_by_name, 
+    get_chat_topic_by_name,
+    get_posts_for_route, 
     get_route_by_id,
     get_route_targets,
     get_sendable_chat_topics,
@@ -928,3 +929,64 @@ async def cmd_rename_route(message: types.Message):
         )
     else:
         await message.answer(f"Не удалось переименовать маршрут {route_id}.")
+
+
+@commands_router.message(Command("posts"), F.from_user.id == ADMIN_ID)
+async def cmd_list_posts(message: types.Message):
+    """Показывает список постов в маршруте с их внутренними ID и кнопками."""
+    if not message.text: return
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Формат: <code>/posts &lt;ID маршрута&gt;</code>", parse_mode="HTML")
+        return
+    try:
+        route_id = int(args[1])
+    except ValueError:
+        await message.answer("ID маршрута должен быть числом.")
+        return
+        
+    route = get_route_by_id(route_id)
+    if not route:
+        await message.answer(f"Маршрут {route_id} не найден.")
+        return
+        
+    posts = get_posts_for_route(route_id)
+    if not posts:
+        await message.answer(f"В маршруте {route_id} нет постов.")
+        return
+        
+    text = f"<b>📚 Посты в маршруте {route_id}:</b>\n\n"
+    for p in posts[:20]: # Показываем последние 20, чтобы не спамить
+        msg_ids = json.loads(p['message_ids']) if p['message_ids'] else []
+        sent = "✅" if p['is_sent'] else "⏳"
+        btn_count = 0
+        btn_preview = ""
+        if p['buttons_json']:
+            try:
+                btns = json.loads(p['buttons_json'])
+                btn_count = len(btns)
+                preview_parts = [f"{i+1}. {b['text']}" for i, b in enumerate(btns[:3])]
+                btn_preview = ", ".join(preview_parts)
+                if len(btns) > 3:
+                    btn_preview += f"... (+{len(btns)-3})"
+            except:
+                pass
+                
+        text += (
+            f"<b>ID поста:</b> <code>{p['id']}</code> {sent}\n"
+            f"TG Msg IDs: <code>{msg_ids}</code>\n"
+            f"Кнопок: <b>{btn_count}</b>"
+        )
+        if btn_preview:
+            text += f"\n<i>{btn_preview}</i>"
+        text += "\n\n"
+        
+    if len(posts) > 20:
+        text += f"<i>...и еще {len(posts) - 20} постов (показаны последние 20).</i>\n\n"
+        
+    text += "<b>🛠 Управление кнопками:</b>\n"
+    text += "<code>/add_buttons &lt;ID поста&gt; Текст|URL</code> — добавить еще\n"
+    text += "<code>/del_button &lt;ID поста&gt; &lt;номер&gt;</code> — удалить одну\n"
+    text += "<code>/clear_buttons &lt;ID поста&gt;</code> — удалить все"
+    
+    await message.answer(text, parse_mode="HTML")

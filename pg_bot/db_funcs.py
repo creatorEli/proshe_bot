@@ -733,3 +733,54 @@ def get_last_post_id(route_id: int) -> Optional[int]:
     row = c.fetchone()
     conn.close()
     return row['id'] if row else None
+
+
+def get_posts_for_route(route_id: int) -> list[sqlite3.Row]:
+    """Возвращает все посты маршрута с их кнопками для просмотра."""
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute(
+        'SELECT id, message_ids, is_sent, buttons_json FROM posts WHERE route_id = ? ORDER BY id DESC',
+        (route_id,)
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def clear_post_buttons(post_id: int) -> bool:
+    """Полностью удаляет все кнопки у поста."""
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute('UPDATE posts SET buttons_json = NULL WHERE id = ?', (post_id,))
+    conn.commit()
+    updated = c.rowcount > 0
+    conn.close()
+    return updated
+
+def remove_post_button(post_id: int, index: int) -> tuple[bool, str]:
+    """Удаляет одну кнопку по её номеру (начиная с 1)."""
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute('SELECT buttons_json FROM posts WHERE id = ?', (post_id,))
+    row = c.fetchone()
+    if not row or not row['buttons_json']:
+        conn.close()
+        return False, "У поста нет кнопок или пост не найден."
+    
+    try:
+        buttons = json.loads(row['buttons_json'])
+    except Exception:
+        conn.close()
+        return False, "Ошибка чтения кнопок."
+        
+    if index < 1 or index > len(buttons):
+        conn.close()
+        return False, f"Неверный номер. Доступно от 1 до {len(buttons)}."
+        
+    removed = buttons.pop(index - 1)
+    
+    new_json = json.dumps(buttons) if buttons else None
+    c.execute('UPDATE posts SET buttons_json = ? WHERE id = ?', (new_json, post_id))
+    conn.commit()
+    conn.close()
+    return True, f"Кнопка «{removed.get('text', '?')}» удалена."
