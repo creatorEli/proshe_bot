@@ -342,19 +342,22 @@ def schedule_route_job(route):
 
     tz = ZoneInfo(TIMEZONE)
     now = datetime.now(tz)
-
     saved_next_run = route['next_run_time']
+
     if saved_next_run:
         try:
             planned_start = datetime.fromisoformat(saved_next_run)
             if planned_start <= now:
+                # Бот проспал! Пересчитываем от send_time, а не от now
                 logging.warning(
                     f"Маршрут {route_id}: плановое время {planned_start} в прошлом. "
                     f"Пересчитываю от текущего момента."
                 )
-                current_index = route['interval_index'] or 0
-                interval_seconds = intervals[current_index]
-                planned_start = now + timedelta(seconds=interval_seconds)
+                # current_index = route['interval_index'] or 0
+                # interval_seconds = intervals[current_index]
+                # planned_start = now + timedelta(seconds=interval_seconds)
+                planned_start = _find_next_slot_from_anchor(send_time, intervals, now)
+            
             else:
                 logging.info(f"Маршрут {route_id}: восстановлено плановое время = {planned_start}")
         except ValueError:
@@ -387,6 +390,50 @@ def schedule_route_job(route):
         f"Загружен маршрут {route_id}: плановое {planned_start}, "
         f"фактический старт {actual_start}, интервалы [{intervals_display}]"
     )
+
+def _find_next_slot_from_anchor(send_time: str, intervals: list[int], now: datetime) -> datetime:
+    """
+    Находит ближайший будущий слот отправки, привязанный к send_time.
+    
+    Работает так:
+    1. Берём send_time как якорь (сегодня в это время)
+    2. Сумма всех интервалов = длина полного цикла
+    3. Находим, сколько полных циклов прошло с якоря до now
+    4. Берём следующий слот после now
+    """
+    h, m = map(int, send_time.split(':'))
+    #tz = now.tzinfo
+    
+    # Якорь — сегодня в send_time
+    anchor = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    
+    # Если якорь в будущем — он и есть следующий слот
+    if anchor > now:
+        return anchor
+    
+    # Считаем общую длину цикла (сумма всех интервалов)
+    cycle_seconds = sum(intervals)
+    
+    # Сколько секунд прошло с якоря до now
+    elapsed = (now - anchor).total_seconds()
+    
+    # Сколько полных циклов прошло
+    full_cycles = int(elapsed // cycle_seconds)
+    
+    # База — начало текущего цикла
+    cycle_start = anchor + timedelta(seconds=full_cycles * cycle_seconds)
+    
+    # Перебираем слоты внутри цикла, пока не найдём будущий
+    current_slot = cycle_start
+    current_index = 0
+    
+    while current_slot <= now:
+        interval = intervals[current_index % len(intervals)]
+        current_slot += timedelta(seconds=interval)
+        current_index += 1
+    
+    return current_slot
+
 
 def recalculate_and_reschedule(route_id: int, route):
     """Пересчитывает next_run_time и обновляет задачу в планировщике."""
