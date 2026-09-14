@@ -229,7 +229,7 @@ async def _execute_bulk_send(route, source_chat_id: int, post: dict, message_ids
         logging.info(f"Bulk: пост {post['id']} отправлен в {target['ct_name'] or target_chat_id}")
 
     # 3. Обработка случайной рассылки (если включена)
-    if route.get('use_random_targets'):
+    if route['use_random_targets']:
         random_pool = get_random_sendable_targets(exclude_ids=guaranteed_ct_ids)
         if random_pool:
             random_target = random.choice(random_pool)
