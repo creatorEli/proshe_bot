@@ -12,7 +12,7 @@ from aiogram import Router, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
+from aiogram.types import InlineKeyboardMarkup
 
 from config import ADMIN_ID, TIMEZONE
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
@@ -35,8 +35,11 @@ from db_funcs import (
 )
 
 from utils import (
+    apply_pagination_callback,
     format_interval,
     parse_intervals_list,
+    paginate, 
+    build_pagination_keyboard
 )
 
 from state_store import (
@@ -48,6 +51,8 @@ from scheduler_utils import (
     schedule_route_job,
     send_random_post_job
 )
+
+ROUTES_PAGE_SIZE = 5
 
 commands_router = Router(name="routes")
 
@@ -158,7 +163,6 @@ async def cmd_add_route(message: types.Message, state: FSMContext):
     except Exception as e:
         error_text = str(e).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         await message.answer(f"Ошибка: {error_text}\n\n{help_text}", parse_mode="HTML")
-
 
 
 @commands_router.message(Command("set_rounds"), F.from_user.id == ADMIN_ID)
@@ -291,42 +295,56 @@ async def cmd_get_rounds(message: types.Message):
 
 # ---- Просмотр / управление ----
 
+
+def _build_routes_page(routes: list, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Генерирует текст и клавиатуру для одной страницы списка маршрутов."""
+    page_items, current_page, total_pages = paginate(routes, page, ROUTES_PAGE_SIZE)
+    
+    text = "<b>🛣️ Маршруты:</b>\n\n"
+    if not page_items:
+        text += "<i>Маршрутов пока нет.</i>"
+    else:
+        for r in page_items:
+            route_name = r['route_name'] or f"Маршрут {r['id']}"
+            intervals = json.loads(r['intervals_json'] or '[]')
+            intervals_display = ', '.join(format_interval(i) for i in intervals) if intervals else "нет"
+            status = "✅" if r['is_active'] else "❄️"
+            source_ct = get_chat_topic_by_id(r['source_ct_id'])
+            src_name = source_ct['ct_name'] if source_ct and source_ct['ct_name'] else f"ID {r['source_ct_id']}"
+            targets = get_route_targets(r['id'])
+            tgt_names = [t['ct_name'] or f"ID {t['ct_id']}" for t in targets]
+            tgt_display = ", ".join(tgt_names) if tgt_names else "нет целей"
+            random_status = "🎲 вкл" if r['use_random_targets'] else "🎲 выкл"
+            text += (
+                f"{status} ID <code>{r['id']}</code>: {route_name}\n"
+                f"   Ист: {src_name}\n"
+                f"   Цел: {tgt_display}\n"
+                f"   Случ.расс. {random_status}\n"
+                f"   Старт: {r['send_time']} | Инт-ы: [{intervals_display}]\n"
+                f"   Jit: {r['jitter_seconds']} сек.\n\n"
+            )
+    
+    keyboard = build_pagination_keyboard("routes", current_page, total_pages)
+    return text, keyboard
+
+
 @commands_router.message(Command("routes"), F.from_user.id == ADMIN_ID)
 async def cmd_list_routes(message: types.Message):
-    routes = get_all_routes(active_only=False)  # Показываем все, включая замороженные
+    routes = get_all_routes(active_only=False)
     if not routes:
         await message.answer("Маршрутов пока нет. Ты всегда можешь их добавить)")
         return
+    text, keyboard = _build_routes_page(routes, 0)
+    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
-    text = "Маршруты, которые я сохранила для тебя:\n\n"
-    for r in routes:
-        route_name = r['route_name'] or f"Маршрут {r['id']}"
-        intervals = json.loads(r['intervals_json'] or '[]')
-        intervals_display = ', '.join(format_interval(i) for i in intervals) if intervals else "нет"
-        status = "✅" if r['is_active'] else "❄️"
 
-        source_ct = get_chat_topic_by_id(r['source_ct_id'])
-        src_name = source_ct['ct_name'] if source_ct and source_ct['ct_name'] else f"ID {r['source_ct_id']}"
+@commands_router.callback_query(F.data.startswith("routes:"))
+async def routes_pagination(callback: types.CallbackQuery):
+    await apply_pagination_callback(
+        callback,
+        lambda page: _build_routes_page(get_all_routes(active_only=False), page),
+    )
 
-        targets = get_route_targets(r['id'])
-        tgt_names = []
-        for t in targets:
-            t_name = t['ct_name'] or f"ID {t['ct_id']}"
-            tgt_names.append(f"{t_name}")
-        tgt_display = ", ".join(tgt_names) if tgt_names else "нет целей"
-
-        random_status = "🎲 вкл" if r['use_random_targets'] else "🎲 выкл"
-
-        text += (
-            f"{status} ID {r['id']}: {route_name}\n"
-            f"   Ист: {src_name}\n"
-            f"   Цел: {tgt_display}\n"
-            f"   Случ.расс.{random_status}\n"
-            f"   Старт: {r['send_time']} | Инт-ы: [{intervals_display}]\n"
-            f"   Jit: {r['jitter_seconds']} сек.\n\n"
-        )
-
-    await message.answer(text, parse_mode="HTML")
 
 
 @commands_router.message(Command("send_now"), F.from_user.id == ADMIN_ID)

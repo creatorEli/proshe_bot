@@ -3,10 +3,11 @@
 # ==========================================
 
 import json
+import logging
 
 from aiogram import Router, types, F
 from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
+from aiogram.types import InlineKeyboardMarkup
 
 from config import ADMIN_ID
 from db_funcs import (
@@ -21,9 +22,14 @@ from db_funcs import (
 )
 
 from utils import (
+    apply_pagination_callback,
     format_interval,
     parse_intervals_list,
+    paginate, 
+    build_pagination_keyboard
 )
+
+SINGULAR_PAGE_SIZE = 5
 
 from state_store import (
     AddRouteStates
@@ -116,45 +122,56 @@ async def cmd_add_singular(message: types.Message):
         await message.answer(f"Ошибка: {e}")
 
 
+def _build_singular_page(routes: list, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Генерирует текст и клавиатуру для одной страницы списка singular-маршрутов."""
+    page_items, current_page, total_pages = paginate(routes, page, SINGULAR_PAGE_SIZE)
+    
+    text = "<b>📢 Singular-маршруты:</b>\n\n"
+    if not page_items:
+        text += "<i>Singular-маршрутов пока нет.</i>"
+    else:
+        for r in page_items:
+            route_name = r['route_name'] or f"Маршрут {r['id']}"
+            status = "✅" if r['is_active'] else "❄️"
+            source_ct = get_chat_topic_by_id(r['source_ct_id'])
+            src_name = source_ct['ct_name'] if source_ct and source_ct['ct_name'] else f"ID {r['source_ct_id']}"
+            targets = get_route_targets(r['id'], active_only=False)
+            tgt_names = [t['ct_name'] or f"ID {t['ct_id']}" for t in targets]
+            tgt_display = ", ".join(tgt_names) if tgt_names else "нет целей"
+            intervals = json.loads(r['intervals_json'] or '[]')
+            intervals_display = ', '.join(format_interval(i) for i in intervals) if intervals else "нет"
+            completed = r['completed_rounds']
+            max_r = r['max_rounds']
+            rounds_text = f"{completed} (бесконечно)" if max_r == -1 else f"{completed}/{max_r}"
+            
+            text += (
+                f"{status} ID <code>{r['id']}</code>: {route_name}\n"
+                f"   Ист: {src_name}\n"
+                f"   Цел: {tgt_display}\n"
+                f"   Круги: {rounds_text}\n"
+                f"   Старт: {r['send_time']} | Интервалы: [{intervals_display}]\n\n"
+            )
+    
+    keyboard = build_pagination_keyboard("singular", current_page, total_pages)
+    return text, keyboard
+
+
 @commands_router.message(Command("list_singular"), F.from_user.id == ADMIN_ID)
 async def cmd_list_singular(message: types.Message):
     routes = get_all_routes(active_only=False)
     singular_routes = [r for r in routes if r['route_mode'] == 'singular']
-    
     if not singular_routes:
         await message.answer("Singular-маршрутов пока нет.")
         return
-    
-    text = "<b>📢 Singular-маршруты:</b>\n\n"
-    for r in singular_routes:
-        route_name = r['route_name'] or f"Маршрут {r['id']}"
-        status = "✅" if r['is_active'] else "❄️"
-        
-        source_ct = get_chat_topic_by_id(r['source_ct_id'])
-        src_name = source_ct['ct_name'] if source_ct and source_ct['ct_name'] else f"ID {r['source_ct_id']}"
-        
-        targets = get_route_targets(r['id'], active_only=False)
-        tgt_names = [t['ct_name'] or f"ID {t['ct_id']}" for t in targets]
-        tgt_display = ", ".join(tgt_names) if tgt_names else "нет целей"
+    text, keyboard = _build_singular_page(singular_routes, 0)
+    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
-        intervals = json.loads(r['intervals_json'] or '[]')
-        intervals_display = ', '.join(format_interval(i) for i in intervals) if intervals else "нет"
-                
-        
-        completed = r['completed_rounds']
-        max_r = r['max_rounds']
-        if max_r == -1:
-            rounds_text = f"{completed} (бесконечно)"
-        else:
-            rounds_text = f"{completed}/{max_r}"
-        
-        text += (
-            f"{status} ID {r['id']}: {route_name}\n"
-            f"   Ист: {src_name}\n"
-            f"   Цел: {tgt_display}\n"
-            f"   Круги: {rounds_text}\n"
-            f"   Старт: {r['send_time']} | Интервалы: [{intervals_display}]\n\n"
-        )
-    
-    await message.answer(text, parse_mode="HTML")
 
+@commands_router.callback_query(F.data.startswith("singular:"))
+async def singular_pagination(callback: types.CallbackQuery):
+    def build(page: int):
+        routes = get_all_routes(active_only=False)
+        singular_routes = [r for r in routes if r['route_mode'] == 'singular']
+        return _build_singular_page(singular_routes, page)
+
+    await apply_pagination_callback(callback, build)

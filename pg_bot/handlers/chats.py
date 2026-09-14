@@ -3,13 +3,23 @@
 # ==========================================
 
 
+import logging
+
 from aiogram import Router, types, F
 from aiogram.filters import Command
 
 from config import ADMIN_ID
 from utils import (
+    apply_pagination_callback,
     resolve_source_chat,
+    paginate, 
+    build_pagination_keyboard
 )
+
+from aiogram.types import InlineKeyboardMarkup
+
+CHATS_PAGE_SIZE = 10
+
 
 from db_funcs import (
     add_chat_topic,
@@ -91,6 +101,44 @@ async def cmd_add_chat(message: types.Message):
         await message.answer(f"Ошибка: {e}")
 
 
+
+
+def _build_chats_page(chats: list, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Генерирует текст и клавиатуру для одной страницы списка чатов."""
+    page_items, current_page, total_pages = paginate(chats, page, CHATS_PAGE_SIZE)
+    
+    text = "<b>📚 Зарегистрированные чаты и топики:</b>\n\n"
+    if not page_items:
+        text += "<i>Чатов пока нет.</i>"
+    else:
+        for c in page_items:
+            status = "✅" if c['is_active'] else "❄️"
+            sendable = "▶️" if c['ct_sendable'] else "⬇️"
+            name = c['ct_name'] or "<i>без имени</i>"
+            usage = check_chat_topic_in_use(c['id'])
+            usage_parts = []
+            if usage['as_source']:
+                usage_parts.append(f"источник для {usage['as_source']}")
+            if usage['as_target']:
+                usage_parts.append(f"цель для {usage['as_target']}")
+            usage_text = ", ".join(usage_parts) if usage_parts else "не используется"
+            topic_text = f":{c['ct_tg_topic_id']}" if c['ct_tg_topic_id'] else ""
+            text += (
+                f"{status}{sendable} ID <code>{c['id']}</code>: {name}\n"
+                f"   TG: <code>{c['ct_tg_chat_id']}{topic_text}</code>\n"
+                f"   {usage_text}\n\n"
+            )
+    
+    text += (
+        "<b>Легенда:</b>\n"
+        "✅ активен / ❄️ заморожен\n"
+        "▶️ sendable / ⬇️ только источник"
+    )
+    
+    keyboard = build_pagination_keyboard("chats", current_page, total_pages)
+    return text, keyboard
+
+
 @commands_router.message(Command("chats"), F.from_user.id == ADMIN_ID)
 async def cmd_list_chats(message: types.Message):
     chats = get_all_chat_topics(active_only=False)
@@ -101,35 +149,19 @@ async def cmd_list_chats(message: types.Message):
             parse_mode="HTML"
         )
         return
+    text, keyboard = _build_chats_page(chats, 0)
+    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
-    text = "<b>📚 Зарегистрированные чаты и топики:</b>\n\n"
-    for c in chats:
-        status = "✅" if c['is_active'] else "❄️"
-        sendable = "▶️" if c['ct_sendable'] else "⬇️"
-        name = c['ct_name'] or "<i>без имени</i>"
 
-        usage = check_chat_topic_in_use(c['id'])
-        usage_parts = []
-        if usage['as_source']:
-            usage_parts.append(f"источник для {usage['as_source']}")
-        if usage['as_target']:
-            usage_parts.append(f"цель для {usage['as_target']}")
-        usage_text = ", ".join(usage_parts) if usage_parts else "не используется"
-
-        topic_text = f":{c['ct_tg_topic_id']}" if c['ct_tg_topic_id'] else ""
-
-        text += (
-            f"{status}{sendable} ID {c['id']} : {name}\n"
-            f"   TG: {c['ct_tg_chat_id']}{topic_text}\n"
-            f"   {usage_text}\n\n"
-        )
-
-    text += (
-        "<b>Легенда:</b>\n"
-        "✅ активен / ❄️ заморожен\n"
-        "▶️ sendable (можно отправлять) / ⬇️ только источник"
+@commands_router.callback_query(F.data.startswith("chats:"))
+async def chats_pagination(callback: types.CallbackQuery):
+    await apply_pagination_callback(
+        callback,
+        lambda page: _build_chats_page(get_all_chat_topics(active_only=False), page),
     )
-    await message.answer(text, parse_mode="HTML")
+
+
+
 
 
 @commands_router.message(Command("rename_chat"), F.from_user.id == ADMIN_ID)
