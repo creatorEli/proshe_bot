@@ -89,10 +89,10 @@ async def cmd_add_chat(message: types.Message):
 
         await message.answer(
             f"✅ Чат зарегистрирован!\n"
-            f"ID: <code>{ct_id}</code>\n"
-            f"Имя: <code>{name}</code>\n"
-            f"TG: <code>{tg_chat_id}:{tg_topic_id}</code>\n"
-            f"Sendable: нет (переключи через /toggle_sendable, если нужно)",
+            f"ID: {ct_id}\n"
+            f"Имя: {name}\n"
+            f"TG: {tg_chat_id}:{tg_topic_id}\n"
+            f"Sendable: нет (переключи через <code>/toggle_sendable {ct_id}</code>, если нужно)",
             parse_mode="HTML"
         )
     except ValueError as e:
