@@ -52,7 +52,7 @@ from scheduler_utils import (
     send_random_post_job
 )
 
-ROUTES_PAGE_SIZE = 3
+ROUTES_PAGE_SIZE = 2
 
 commands_router = Router(name="routes")
 

@@ -29,7 +29,7 @@ from utils import (
     build_pagination_keyboard
 )
 
-SINGULAR_PAGE_SIZE = 3
+SINGULAR_PAGE_SIZE = 2
 
 from state_store import (
     AddRouteStates
