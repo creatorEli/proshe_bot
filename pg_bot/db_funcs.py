@@ -45,6 +45,7 @@ def init_db():
         completed_rounds INTEGER DEFAULT 0,
         is_active INTEGER DEFAULT 1,
         use_random_targets INTEGER DEFAULT 0,
+        random_pool_tags TEXT DEFAULT '[]'
         FOREIGN KEY(source_ct_id) REFERENCES chats_topics(id)
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS route_targets (
@@ -70,6 +71,12 @@ def init_db():
     # === МИГРАЦИЯ: теги чатов ===
     try:
         c.execute("ALTER TABLE chats_topics ADD COLUMN ct_tags TEXT DEFAULT '[]'")
+    except sqlite3.OperationalError:
+        pass  # колонка уже есть
+
+    # === МИГРАЦИЯ: фильтр случайного пула у маршрутов ===
+    try:
+        c.execute("ALTER TABLE routes ADD COLUMN random_pool_tags TEXT DEFAULT '[]'")
     except sqlite3.OperationalError:
         pass  # колонка уже есть
 
@@ -230,7 +237,7 @@ def update_route(route_id: int, **kwargs) -> bool:
         'route_name', 'route_mode', 'source_ct_id', 'send_time',
         'intervals_json', 'interval_index', 'jitter_seconds',
         'next_run_time', 'max_rounds', 'completed_rounds', 'is_active',
-        'use_random_targets',
+        'use_random_targets','random_pool_tags',
     }
     fields = {k: v for k, v in kwargs.items() if k in allowed}
     if not fields:
@@ -621,9 +628,10 @@ def check_singular_round_complete(route_id: int, current_round: int) -> bool:
     conn = _get_conn()
     c = conn.cursor()
     c.execute('''
-        SELECT 1 FROM route_targets 
-        WHERE route_id = ? AND is_active = 1 
-          AND (last_sent_round < ? OR last_sent_round IS NULL)
+        SELECT 1 FROM route_targets rt
+        JOIN chats_topics ct ON rt.ct_id = ct.id
+        WHERE rt.route_id = ? AND rt.is_active = 1 AND ct.is_active = 1
+          AND (rt.last_sent_round < ? OR rt.last_sent_round IS NULL)
         LIMIT 1
     ''', (route_id, current_round))
     row = c.fetchone()
@@ -635,14 +643,13 @@ def check_singular_round_complete(route_id: int, current_round: int) -> bool:
 # Поиск маршрутов по источнику (для collector_router)
 # ============================================================
 
-def get_random_sendable_targets(exclude_ids: list[int]) -> list[sqlite3.Row]:
+def get_random_sendable_targets(exclude_ids: list[int], pool_tags: Optional[list[str]] = None) -> list[sqlite3.Row]:
     """
-    Возвращает все активные sendable-чаты, КРОМЕ указанных в exclude_ids.
-    Используется для случайной рассылки.
+    Активные sendable-чаты для случайной рассылки, КРОМЕ exclude_ids.
+    pool_tags — фильтр маршрута: 'tag' = обязан иметь (AND), '-tag' = обязан не иметь.
     """
     conn = _get_conn()
     c = conn.cursor()
-    
     if exclude_ids:
         placeholders = ','.join('?' * len(exclude_ids))
         c.execute(
@@ -659,7 +666,27 @@ def get_random_sendable_targets(exclude_ids: list[int]) -> list[sqlite3.Row]:
     
     rows = c.fetchall()
     conn.close()
-    return rows
+
+    if not pool_tags:
+        return rows
+
+    include = {normalize_tag(t) for t in pool_tags if not t.startswith('-') and normalize_tag(t)}
+    exclude = {normalize_tag(t[1:]) for t in pool_tags if t.startswith('-') and normalize_tag(t[1:])}
+    if not include and not exclude:
+        return rows
+
+    result = []
+    for row in rows:
+        try:
+            row_tags = set(json.loads(row['ct_tags'] or '[]'))
+        except Exception:
+            row_tags = set()
+        if include and not include.issubset(row_tags):
+            continue
+        if exclude and (exclude & row_tags):
+            continue
+        result.append(row)
+    return result
 
 
 def get_routes_for_source(tg_chat_id: int, tg_topic_id: int = 0) -> list[sqlite3.Row]:

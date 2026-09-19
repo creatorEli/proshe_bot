@@ -29,6 +29,7 @@ from db_funcs import (
     get_chat_topic_by_id,
     get_chat_topic_by_name,
     get_chat_topic_by_tg_ids,
+    get_chats_by_tags,
     update_chat_topic,
     update_chat_tags,
     normalize_tag,
@@ -354,16 +355,45 @@ async def cmd_rename_chat(message: types.Message):
 async def cmd_freeze_chat(message: types.Message):
     if not message.text:
         return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Формат: <code>/freeze_chat &lt;id&gt;</code>", parse_mode="HTML")
-        return
-    try:
-        ct_id = int(args[1])
-    except ValueError:
-        await message.answer("ID должен быть числом.")
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer(
+            "Формат: <code>/freeze_chat &lt;id&gt;</code> или <code>/freeze_chat tag:old tag:unpopular</code> (AND)",
+            parse_mode="HTML"
+        )
         return
 
+    # ---- Режим тегов ----
+    if parts[1].lower().startswith('tag:'):
+        if any(not p.lower().startswith('tag:') for p in parts[1:]):
+            await message.answer("В режиме тегов все аргументы должны быть вида <code>tag:имя</code>.", parse_mode="HTML")
+            return
+        tags = [p[4:] for p in parts[1:] if len(p) > 4]
+        if not tags:
+            await message.answer("Пустое имя тега.")
+            return
+        rows = get_chats_by_tags(tags, active_only=True, sendable_only=False)
+        if not rows:
+            await message.answer(f"Нет активных чатов со ВСЕМИ тегами: {', '.join(tags)}.")
+            return
+        names = []
+        for row in rows:
+            if update_chat_topic(row['id'], is_active=False):
+                names.append(row['ct_name'] or f"ID {row['id']}")
+        shown = ", ".join(names[:15]) + ("…" if len(names) > 15 else "")
+        await message.answer(
+            f"❄️ Заморожено чатов: {len(names)} (теги: {', '.join(tags)})\n{shown}\n"
+            f"<i>Посты в них не идут ни из одного маршрута. Вернуть: /unfreeze_chat tag:...</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    # ---- Старый режим id ----
+    try:
+        ct_id = int(parts[1])
+    except ValueError:
+        await message.answer("ID должен быть числом, либо используй режим тегов.")
+        return
     ct = get_chat_topic_by_id(ct_id)
     if not ct:
         await message.answer(f"Чат {ct_id} не найден.")
@@ -371,41 +401,68 @@ async def cmd_freeze_chat(message: types.Message):
     if not ct['is_active']:
         await message.answer(f"Чат {ct_id} уже заморожен.")
         return
-
     if update_chat_topic(ct_id, is_active=False):
         name = ct['ct_name'] or f"чат {ct_id}"
         await message.answer(f"❄️ Чат <code>{name}</code> (ID {ct_id}) заморожен.")
     else:
         await message.answer("Не удалось заморозить.")
 
-
 @commands_router.message(Command("unfreeze_chat"), F.from_user.id == ADMIN_ID)
 async def cmd_unfreeze_chat(message: types.Message):
     if not message.text:
         return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Формат: <code>/unfreeze_chat &lt;id&gt;</code>", parse_mode="HTML")
-        return
-    try:
-        ct_id = int(args[1])
-    except ValueError:
-        await message.answer("ID должен быть числом.")
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer(
+            "Формат: <code>/unfreeze_chat &lt;id&gt;</code> или <code>/unfreeze_chat tag:old tag:unpopular</code> (AND)",
+            parse_mode="HTML"
+        )
         return
 
+    # ---- Режим тегов ----
+    if parts[1].lower().startswith('tag:'):
+        if any(not p.lower().startswith('tag:') for p in parts[1:]):
+            await message.answer("В режиме тегов все аргументы должны быть вида <code>tag:имя</code>.", parse_mode="HTML")
+            return
+        tags = [p[4:] for p in parts[1:] if len(p) > 4]
+        if not tags:
+            await message.answer("Пустое имя тега.")
+            return
+        rows = get_chats_by_tags(tags, active_only=False, sendable_only=False)
+        rows = [r for r in rows if not r['is_active']]  
+        if not rows:
+            await message.answer(f"Нет замороженных чатов со ВСЕМИ тегами: {', '.join(tags)}.")
+            return
+        names = []
+        for row in rows:
+            if update_chat_topic(row['id'], is_active=False):
+                names.append(row['ct_name'] or f"ID {row['id']}")
+        shown = ", ".join(names[:15]) + ("…" if len(names) > 15 else "")
+        await message.answer(
+            f"❄️ Разморожено чатов: {len(names)} (теги: {', '.join(tags)})\n{shown}\n"
+            f"<i>Посты в них идут во все заданные маршруты. Вернуть: /freeze_chat tag:...</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    # ---- Старый режим id ----
+    try:
+        ct_id = int(parts[1])
+    except ValueError:
+        await message.answer("ID должен быть числом, либо используй режим тегов.")
+        return
     ct = get_chat_topic_by_id(ct_id)
     if not ct:
         await message.answer(f"Чат {ct_id} не найден.")
         return
-    if ct['is_active']:
-        await message.answer(f"Чат {ct_id} уже активен.")
+    if not ct['is_active']:
+        await message.answer(f"Чат {ct_id} уже заморожен.")
         return
-
-    if update_chat_topic(ct_id, is_active=True):
+    if update_chat_topic(ct_id, is_active=False):
         name = ct['ct_name'] or f"чат {ct_id}"
-        await message.answer(f"✅ Чат <code>{name}</code> (ID {ct_id}) разморожен.")
+        await message.answer(f"❄️ Чат <code>{name}</code> (ID {ct_id}) разаморожен.")
     else:
-        await message.answer("Не удалось разморозить.")
+        await message.answer("Не удалось заморозить.")
 
 
 @commands_router.message(Command("toggle_sendable"), F.from_user.id == ADMIN_ID)

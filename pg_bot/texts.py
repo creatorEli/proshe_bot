@@ -23,6 +23,8 @@ HELP_TEXT = (
     "<code>/delete_route &lt;ID&gt;</code> — удалить маршрут\n"
     "<code>/freeze_route &lt;ID&gt;</code> — заморозить маршрут\n"
     "<code>/unfreeze_route &lt;ID&gt;</code> — разморозить маршрут\n"
+    "<code>/freeze_chat tag:тег</code> / <code>/unfreeze_chat tag:тег</code> — (раз)морозить все чаты с тегами\n"
+    "<code>/set_pool_tags &lt;ID&gt; [tag | -tag ...]</code> — фильтр случайного пула маршрута\n\n"
     "<code>/edit_time &lt;ID&gt; &lt;ЧЧ:ММ&gt;</code> — изменить время\n"
     "<code>/edit_intervals &lt;ID&gt; &lt;интервалы&gt;</code> — изменить интервалы\n"
     "<code>/edit_jitter &lt;ID&gt; &lt;секунды&gt;</code> — изменить разброс\n"

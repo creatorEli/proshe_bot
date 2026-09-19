@@ -29,6 +29,7 @@ from db_funcs import (
     get_route_by_id,
     get_route_targets,
     get_sendable_chat_topics,
+    normalize_tag,
     remove_route_target,
     skip_next_publication,
     update_route,
@@ -196,7 +197,7 @@ async def cmd_add_route(message: types.Message, state: FSMContext):
     except Exception as e:
         error_text = str(e).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         await message.answer(f"Ошибка: {error_text}\n\n{help_text}", parse_mode="HTML")
-        
+
 
 @commands_router.message(Command("set_rounds"), F.from_user.id == ADMIN_ID)
 async def cmd_set_rounds(message: types.Message):
@@ -348,6 +349,8 @@ def _build_routes_page(routes: list, page: int) -> tuple[str, InlineKeyboardMark
             tgt_names = [t['ct_name'] or f"ID {t['ct_id']}" for t in targets]
             tgt_display = ", ".join(tgt_names) if tgt_names else "нет целей"
             random_status = "🎲 вкл" if r['use_random_targets'] else "🎲 выкл"
+            pool_tags = json.loads(r['random_pool_tags'] or '[]')
+            pool_line = f"   🎯 Фильтр пула: {', '.join(pool_tags)}\n" if pool_tags else ""
             text += (
                 f"{status} ID <code>{r['id']}</code>: {route_name}\n"
                 f"   Ист: {src_name}\n"
@@ -1051,4 +1054,53 @@ async def cmd_list_posts(message: types.Message):
     text += "<code>/del_button &lt;ID поста&gt; &lt;номер&gt;</code> — удалить одну\n"
     text += "<code>/clear_buttons &lt;ID поста&gt;</code> — удалить все"
     
-    await message.answer(text, parse_mode="HTML")
+    await message.answer(text, parse_mode="HTML")\
+
+
+@commands_router.message(Command("set_pool_tags"), F.from_user.id == ADMIN_ID)
+async def cmd_set_pool_tags(message: types.Message):
+    """Задаёт фильтр тегов для случайного пула маршрута (пусто = без фильтра)."""
+    if not message.text:
+        return
+    args = message.text.split(maxsplit=2)
+    if len(args) < 2:
+        await message.answer(
+            "<b>Формат:</b>\n"
+            "<code>/set_pool_tags &lt;ID маршрута&gt; [теги...]</code>\n\n"
+            "<b>Примеры:</b>\n"
+            "<code>/set_pool_tags 5 asia -old</code> — рандом только из чатов с тегом asia и БЕЗ тега old\n"
+            "<code>/set_pool_tags 5</code> — снять фильтр (весь sendable-пул)\n\n"
+            "Токены: <code>tag</code> — обязан иметь (AND), <code>-tag</code> — обязан не иметь.",
+            parse_mode="HTML"
+        )
+        return
+    try:
+        route_id = int(args[1])
+    except ValueError:
+        await message.answer("ID маршрута должен быть числом.")
+        return
+    route = get_route_by_id(route_id)
+    if not route:
+        await message.answer(f"Маршрут {route_id} не найден.")
+        return
+
+    tokens = []
+    if len(args) == 3:
+        for tok in args[2].replace(',', ' ').split():
+            raw = tok[1:] if tok.startswith('-') else tok
+            norm = normalize_tag(raw)
+            if not norm:
+                await message.answer(f"⚠️ Пустой тег в токене <code>{tok}</code>.", parse_mode="HTML")
+                return
+            tokens.append(('-' + norm) if tok.startswith('-') else norm)
+
+    if update_route(route_id, random_pool_tags=json.dumps(tokens)):
+        if tokens:
+            await message.answer(
+                f"✅ Фильтр случайного пула маршрута {route_id}: <code>{', '.join(tokens)}</code>",
+                parse_mode="HTML"
+            )
+        else:
+            await message.answer(f"✅ Фильтр случайного пула маршрута {route_id} снят (весь sendable-пул).")
+    else:
+        await message.answer("Не удалось обновить фильтр.")

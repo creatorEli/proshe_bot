@@ -230,20 +230,26 @@ async def _execute_bulk_send(route, source_chat_id: int, post: dict, message_ids
 
     # 3. Обработка случайной рассылки (если включена)
     if route['use_random_targets']:
-        random_pool = get_random_sendable_targets(exclude_ids=guaranteed_ct_ids)
+        # Читаем фильтр пула маршрута: ['asia', '-old'] и т.п.
+        pool_tags = json.loads(route['random_pool_tags'] or '[]')
+
+        random_pool = get_random_sendable_targets(
+            exclude_ids=guaranteed_ct_ids,
+            pool_tags=pool_tags or None,   # None = старого поведения (весь sendable-пул)
+        )
+
         if random_pool:
             random_target = random.choice(random_pool)
             target_chat_id = random_target['ct_tg_chat_id']
             target_topic_id = random_target['ct_tg_topic_id']
-            
+
             send_kwargs = {'message_thread_id': target_topic_id} if target_topic_id else {}
             logging.info(f"Bulk {route_id}: доп. случайная отправка в {random_target['ct_name'] or target_chat_id}")
 
             # Задержка и перед случайной целью тоже
             logging.info(f"Bulk {route_id}: ожидание {BULK_TARGET_DELAY} сек. перед случайной отправкой в {random_target['ct_name'] or target_chat_id}...")
             await asyncio.sleep(BULK_TARGET_DELAY)
-            
-            
+
             try:
                 if len(message_ids) > 1 and hasattr(bot, 'copy_messages'):
                     await bot.copy_messages(chat_id=target_chat_id, from_chat_id=source_chat_id, message_ids=message_ids, **send_kwargs)
@@ -254,7 +260,11 @@ async def _execute_bulk_send(route, source_chat_id: int, post: dict, message_ids
 
             except Exception as e:
                 logging.warning(f"Не удалось отправить в случайный чат {target_chat_id}: {e}")
-
+        else:
+            logging.info(
+                f"Маршрут {route_id}: случайная рассылка включена, но пул пуст "
+                f"(sendable минус гарантированные минус фильтр {pool_tags or 'без фильтра'})."
+            )
     # 4. Помечаем пост как отправленный
     mark_post_sent(post['id'])
     return True
