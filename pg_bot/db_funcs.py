@@ -45,7 +45,7 @@ def init_db():
         completed_rounds INTEGER DEFAULT 0,
         is_active INTEGER DEFAULT 1,
         use_random_targets INTEGER DEFAULT 0,
-        random_pool_tags TEXT DEFAULT '[]'
+        random_pool_tags TEXT DEFAULT '[]',
         FOREIGN KEY(source_ct_id) REFERENCES chats_topics(id)
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS route_targets (
