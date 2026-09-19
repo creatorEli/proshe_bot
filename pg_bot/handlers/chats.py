@@ -4,7 +4,7 @@
 
 
 import logging
-
+import json
 from aiogram import Router, types, F
 from aiogram.filters import Command
 
@@ -29,7 +29,10 @@ from db_funcs import (
     get_chat_topic_by_id,
     get_chat_topic_by_name,
     get_chat_topic_by_tg_ids,
-    update_chat_topic
+    update_chat_topic,
+    update_chat_tags,
+    normalize_tag,
+    get_all_tags
 )
 
 # Каждый модуль создаёт СВОЙ роутер
@@ -123,9 +126,18 @@ def _build_chats_page(chats: list, page: int) -> tuple[str, InlineKeyboardMarkup
                 usage_parts.append(f"цель для {usage['as_target']}")
             usage_text = ", ".join(usage_parts) if usage_parts else "не используется"
             topic_text = f":{c['ct_tg_topic_id']}" if c['ct_tg_topic_id'] else ""
+
+            try:
+                tag_list = json.loads(c['ct_tags'] or '[]')
+            except Exception:
+                tag_list = []
+
+            tags_line = f"   🏷 {', '.join(tag_list)}\n" if tag_list else ""
+
             text += (
                 f"{status}{sendable} ID <code>{c['id']}</code>: {name}\n"
                 f"   TG: <code>{c['ct_tg_chat_id']}{topic_text}</code>\n"
+                f"{tags_line}"
                 f"   {usage_text}\n\n"
             )
     
@@ -161,6 +173,137 @@ async def chats_pagination(callback: types.CallbackQuery):
     )
 
 
+
+
+def _parse_tags_str(s: str) -> list[str]:
+    """Разбивает строку тегов по пробелам и запятым."""
+    return [tok.strip() for tok in s.replace(',', ' ').split() if tok.strip()]
+
+
+@commands_router.message(Command("set_tags"), F.from_user.id == ADMIN_ID)
+async def cmd_set_tags(message: types.Message):
+    """Полностью заменяет набор тегов чата (пусто = очистить)."""
+    if not message.text:
+        return
+    args = message.text.split(maxsplit=2)
+    if len(args) < 2:
+        await message.answer(
+            "Формат: <code>/set_tags &lt;id чата&gt; &lt;теги...&gt;</code>\n"
+            "Пример: <code>/set_tags 12 asia vietnam</code>\n"
+            "Без тегов — очистить все.",
+            parse_mode="HTML"
+        )
+        return
+    try:
+        ct_id = int(args[1])
+    except ValueError:
+        await message.answer("ID чата должен быть числом.")
+        return
+    ct = get_chat_topic_by_id(ct_id)
+    if not ct:
+        await message.answer(f"Чат {ct_id} не найден.")
+        return
+    tags = _parse_tags_str(args[2]) if len(args) == 3 else []
+    if update_chat_tags(ct_id, tags, mode='set'):
+        if tags:
+            shown = ', '.join(normalize_tag(t) for t in tags)
+            await message.answer(f"✅ Чат <code>{ct_id}</code>: теги установлены → <code>{shown}</code>", parse_mode="HTML")
+        else:
+            await message.answer(f"✅ Чат <code>{ct_id}</code>: все теги очищены.", parse_mode="HTML")
+    else:
+        await message.answer("Не удалось обновить теги.")
+
+
+@commands_router.message(Command("add_tags"), F.from_user.id == ADMIN_ID)
+async def cmd_add_tags(message: types.Message):
+    """Добавляет теги к чату, не трогая существующие."""
+    if not message.text:
+        return
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        await message.answer(
+            "Формат: <code>/add_tags &lt;id чата&gt; &lt;теги...&gt;</code>\n"
+            "Пример: <code>/add_tags 12 old_promo</code>",
+            parse_mode="HTML"
+        )
+        return
+    try:
+        ct_id = int(args[1])
+    except ValueError:
+        await message.answer("ID чата должен быть числом.")
+        return
+    ct = get_chat_topic_by_id(ct_id)
+    if not ct:
+        await message.answer(f"Чат {ct_id} не найден.")
+        return
+    tags = _parse_tags_str(args[2])
+    if not tags:
+        await message.answer("Не указаны теги.")
+        return
+    if update_chat_tags(ct_id, tags, mode='add'):
+        shown = ', '.join(normalize_tag(t) for t in tags)
+        await message.answer(f"✅ Чат {ct_id}: добавлены теги {shown}", parse_mode="HTML")
+    else:
+        await message.answer("Не удалось обновить теги.")
+
+
+@commands_router.message(Command("remove_tags"), F.from_user.id == ADMIN_ID)
+async def cmd_remove_tags(message: types.Message):
+    """Убирает указанные теги у чата."""
+    if not message.text:
+        return
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        await message.answer(
+            "Формат: <code>/remove_tags &lt;id чата&gt; &lt;теги...&gt;</code>",
+            parse_mode="HTML"
+        )
+        return
+    try:
+        ct_id = int(args[1])
+    except ValueError:
+        await message.answer("ID чата должен быть числом.")
+        return
+    ct = get_chat_topic_by_id(ct_id)
+    if not ct:
+        await message.answer(f"Чат {ct_id} не найден.")
+        return
+    tags = _parse_tags_str(args[2])
+    if not tags:
+        await message.answer("Не указаны теги.")
+        return
+    if update_chat_tags(ct_id, tags, mode='remove'):
+        shown = ', '.join(normalize_tag(t) for t in tags)
+        await message.answer(f"✅ Чат {ct_id}: убраны теги <code>{shown}</code>", parse_mode="HTML")
+    else:
+        await message.answer("Не удалось обновить теги.")
+
+
+@commands_router.message(Command("tags"), F.from_user.id == ADMIN_ID)
+async def cmd_list_tags(message: types.Message):
+    """Показывает все теги и чаты, которые ими помечены."""
+    tags_map = get_all_tags()
+    if not tags_map:
+        await message.answer(
+            "Тегов пока нет.\n"
+            "Проставь: <code>/set_tags &lt;id чата&gt; &lt;теги...&gt;</code> или <code>/add_tags ...</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    chats = {c['id']: (c['ct_name'] or f"ID {c['id']}") for c in get_all_chat_topics(active_only=False)}
+    text = "<b>🏷 Теги:</b>\n\n"
+    for tag in sorted(tags_map):
+        ids = tags_map[tag]
+        names = ', '.join(chats.get(i, f"ID {i}") for i in ids)
+        text += f"tag:{tag} — {len(ids)} шт.\n   {names}\n\n"
+    text += (
+        "<b>Как использовать (AND):</b>\n"
+        "<code>/add_target 20 tag:asia tag:old</code> — чаты, у которых ЕСТЬ оба тега\n"
+        "<code>/remove_target 20 tag:dead</code>\n"
+        "<code>/add_route src tag:asia 18:00 01:00:00:00</code>"
+    )
+    await message.answer(text, parse_mode="HTML")
 
 
 

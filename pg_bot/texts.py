@@ -46,4 +46,10 @@ HELP_TEXT = (
     "<code>/set_rounds &lt;ID&gt; &lt;N&gt;</code> — установить количество кругов (-1 = бесконечно)\n"
     "<code>/extend_route &lt;ID&gt; &lt;N&gt;</code> — продлить маршрут на N кругов\n"
     "<code>/get_rounds &lt;ID&gt;</code> — показать статус кругов\n\n"
+
+    "<b>🏷 Теги чатов:</b>\n"
+    "<code>/set_tags &lt;id&gt; &lt;теги...&gt;</code> — заменить набор тегов (пусто = очистить)\n"
+    "<code>/add_tags &lt;id&gt; &lt;теги...&gt;</code> / <code>/remove_tags &lt;id&gt; &lt;теги...&gt;</code>\n"
+    "<code>/tags</code> — список всех тегов и помеченных чатов\n"
+    "В целях: <code>tag:asia tag:old</code> = чаты со ВСЕМИ тегами (AND)\n\n"
 )

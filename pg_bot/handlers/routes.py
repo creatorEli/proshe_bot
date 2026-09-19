@@ -31,7 +31,8 @@ from db_funcs import (
     get_sendable_chat_topics,
     remove_route_target,
     skip_next_publication,
-    update_route
+    update_route,
+    get_chats_by_tags
 )
 
 from utils import (
@@ -39,7 +40,8 @@ from utils import (
     format_interval,
     parse_intervals_list,
     paginate, 
-    build_pagination_keyboard
+    build_pagination_keyboard,
+    parse_interval
 )
 
 from state_store import (
@@ -60,27 +62,25 @@ commands_router = Router(name="routes")
 async def cmd_add_route(message: types.Message, state: FSMContext):
     if not message.text:
         return
-    args = message.text.split()
-
+    args = message.text.split(maxsplit=6)
     help_text = (
         "<b>Однострочный режим:</b>\n"
-        "<code>/add_route &lt;имя_исх&gt; &lt;имя_цели&gt; &lt;ЧЧ:ММ&gt; &lt;интервалы&gt;</code>\n\n"
+        "<code>/add_route &lt;имя_исх&gt; &lt;цели&gt; &lt;ЧЧ:ММ&gt; &lt;интервалы&gt; [jitter] [название]</code>\n\n"
+        "<b>Цели</b> — имена, <code>tag:тег</code> (AND), <code>all</code>, <code>sendable</code> через пробел:\n"
+        "<code>/add_route ads tag:asia 18:00 01:00:00:00</code>\n"
+        "<code>/add_route ads tag:asia tag:old 18:00 01:00:00:00 300 Реклама Азия</code>\n\n"
         "<b>Пошаговый режим:</b>\n"
         "<code>/add_route &lt;имя_исх&gt; &lt;имя_цели&gt;</code>\n"
         "Затем я спрошу название, время, интервалы и разброс.\n\n"
         "<b>💡 Имена чатов</b> — те, что ты зарегистрировал через /add_chat\n"
-        "Посмотри список: /chats"
+        "Посмотри список: /chats, теги: /tags"
     )
-
-    if len(args) not in (3, 5):
+    if len(args) not in (3, 5, 6, 7):
         await message.answer(help_text, parse_mode="HTML")
         return
-
     try:
         source_name = args[1]
-        target_name = args[2]
-
-        # Ищем чаты по именам
+        targets_str = args[2]
         source_ct = get_chat_topic_by_name(source_name)
         if not source_ct:
             await message.answer(
@@ -90,80 +90,113 @@ async def cmd_add_route(message: types.Message, state: FSMContext):
             )
             return
 
-        target_ct = get_chat_topic_by_name(target_name)
-        if not target_ct:
-            await message.answer(
-                f"❌ Целевой чат <code>{target_name}</code> не найден.\n"
-                f"Зарегистрируй его через /add_chat или проверь список: /chats",
-                parse_mode="HTML"
-            )
-            return
-
         if len(args) == 3:
-            # ---- Пошаговый режим ----
+            # ---- Пошаговый режим (без изменений, одна цель по имени) ----
+            target_ct = get_chat_topic_by_name(targets_str)
+            if not target_ct:
+                await message.answer(
+                    f"❌ Целевой чат <code>{targets_str}</code> не найден.\n"
+                    f"Зарегистрируй его через /add_chat или проверь список: /chats",
+                    parse_mode="HTML"
+                )
+                return
             await state.update_data(
                 source_ct_id=source_ct['id'],
                 target_ct_id=target_ct['id'],
                 source_name=source_name,
-                target_name=target_name,
+                target_name=targets_str,
             )
             await state.set_state(AddRouteStates.waiting_for_name)
             await message.answer(
                 f"✅ Найдены чаты:\n"
                 f"  Источник: <code>{source_name}</code> (ID {source_ct['id']})\n"
-                f"  Цель: <code>{target_name}</code> (ID {target_ct['id']})\n\n"
+                f"  Цель: <code>{targets_str}</code> (ID {target_ct['id']})\n\n"
                 f"Теперь отправь название для этого маршрута.",
                 parse_mode="HTML"
             )
-        else:
-            # ---- Однострочный режим ----
-            send_time = args[3]
-            intervals_str = args[4]
+            return
 
-            h, m = map(int, send_time.split(':'))
-            if not (0 <= h <= 23 and 0 <= m <= 59):
-                raise ValueError("Неверное время")
+        # ---- Однострочный режим ----
+        send_time = args[3]
+        intervals_str = args[4]
+        jitter_seconds = 0
+        route_name = None
 
-            intervals = parse_intervals_list(intervals_str)
-            intervals_json = json.dumps(intervals)
+        if len(args) >= 6:
+            try:
+                jitter_seconds = int(args[5])
+            except ValueError:
+                jitter_seconds = parse_interval(args[5])
+            if jitter_seconds < 0:
+                raise ValueError("Разброс не может быть отрицательным")
+        if len(args) == 7:
+            route_name = args[6].strip() or None
 
-            route_name = f"Маршрут {source_name} → {target_name}"
-
-            route_id = add_route(
-                source_ct_id=source_ct['id'],
-                route_name=route_name,
-                route_mode='bulk',
-                send_time=send_time,
-                intervals_json=intervals_json,
-                jitter_seconds=0,
-                max_rounds=-1,
+        h, m = map(int, send_time.split(':'))
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError("Неверное время")
+        intervals = parse_intervals_list(intervals_str)
+        if not intervals:
+            raise ValueError("Список интервалов пуст")
+        if jitter_seconds >= min(intervals):
+            raise ValueError(
+                f"Разброс ({jitter_seconds} сек.) должен быть меньше "
+                f"минимального интервала ({format_interval(min(intervals))})"
             )
 
-            # Явная проверка на None удовлетворяет type checker и предотвращает ошибки БД
-            if route_id is None:
-                await message.answer("❌ Ошибка: не удалось создать маршрут в базе данных.")
-                return
-            
-            add_route_target(route_id, target_ct['id'])
-
-            route = get_route_by_id(route_id)
-            schedule_route_job(route)
-
-            intervals_display = ', '.join(format_interval(i) for i in intervals)
+        # Разрешаем цели (имена + tag: + all/sendable)
+        ids, warnings = _select_chats(targets_str, mode='add')
+        if not ids:
             await message.answer(
-                f"✅ Маршрут {route_id} создан!\n"
-                f"Название: {route_name}\n"
-                f"Первый пост в {send_time}\n"
-                f"Интервалы: [{intervals_display}]",
+                ("❌ Не найдено ни одной цели.\n" if not warnings else "")
+                + "\n".join(warnings),
                 parse_mode="HTML"
             )
+            return
 
+        intervals_json = json.dumps(intervals)
+        if route_name is None:
+            if len(ids) == 1:
+                one = get_chat_topic_by_id(ids[0])
+                one_name = one['ct_name'] if one and one['ct_name'] else f"ID {ids[0]}"
+                route_name = f"Маршрут {source_name} → {one_name}"
+            else:
+                route_name = f"Маршрут {source_name} → целей: {len(ids)}"
+
+        route_id = add_route(
+            source_ct_id=source_ct['id'],
+            route_name=route_name,
+            route_mode='bulk',
+            send_time=send_time,
+            intervals_json=intervals_json,
+            jitter_seconds=jitter_seconds,
+            max_rounds=-1,
+        )
+        if route_id is None:
+            await message.answer("❌ Ошибка: не удалось создать маршрут в базе данных.")
+            return
+        for cid in ids:
+            add_route_target(route_id, cid)
+        route = get_route_by_id(route_id)
+        schedule_route_job(route)
+
+        intervals_display = ', '.join(format_interval(i) for i in intervals)
+        jitter_text = f", разброс {jitter_seconds} сек." if jitter_seconds > 0 else ""
+        await message.answer(
+            f"✅ Маршрут {route_id} создан!\n"
+            f"Название: {route_name}\n"
+            f"Целей добавлено: {len(ids)}\n"
+            f"Первый пост в {send_time}\n"
+            f"Интервалы: [{intervals_display}]{jitter_text}"
+            + (("\n" + "\n".join(warnings)) if warnings else ""),
+            parse_mode="HTML"
+        )
     except ValueError as e:
         await message.answer(f"Ошибка: {e}\n\n{help_text}", parse_mode="HTML")
     except Exception as e:
         error_text = str(e).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         await message.answer(f"Ошибка: {error_text}\n\n{help_text}", parse_mode="HTML")
-
+        
 
 @commands_router.message(Command("set_rounds"), F.from_user.id == ADMIN_ID)
 async def cmd_set_rounds(message: types.Message):
@@ -413,6 +446,67 @@ async def cmd_delete_route(message: types.Message):
         await message.answer(f"Не удалось удалить маршрут {route_id} из базы.")
 
 
+
+def _select_chats(targets_str: str, mode: str, pool: list | None = None) -> tuple[list[int], list[str]]:
+    """
+    Универсальный разбор строки целей.
+    Поддерживает: all, sendable, tag:<тег> (несколько = AND), имена чатов (смесь).
+    mode='add':    pool=None — выбор среди всех чатов.
+    mode='remove': pool=текущие цели (rows из get_route_targets) — выбор только среди них.
+    Возвращает (список ct_id, список предупреждений).
+    """
+    tokens = [t.strip() for t in targets_str.replace(',', ' ').split() if t.strip()]
+    pool_ids = {t['ct_id'] for t in pool} if pool is not None else None
+    ids: list[int] = []
+    seen: set[int] = set()
+    warnings: list[str] = []
+
+    def push(cid: int):
+        if pool_ids is not None and cid not in pool_ids:
+            return
+        if cid not in seen:
+            seen.add(cid)
+            ids.append(cid)
+
+    tags = [t[4:] for t in tokens if t.lower().startswith('tag:') and len(t) > 4]
+    others = [t for t in tokens if not t.lower().startswith('tag:')]
+
+    for tok in others:
+        low = tok.lower()
+        if low == 'all':
+            if pool is not None:
+                for t in pool:
+                    push(t['ct_id'])
+            else:
+                for row in get_all_chat_topics(active_only=True):
+                    push(row['id'])
+        elif low == 'sendable':
+            if pool is not None:
+                for t in pool:
+                    if t['ct_sendable']:
+                        push(t['ct_id'])
+            else:
+                for row in get_sendable_chat_topics():
+                    push(row['id'])
+        else:
+            ct = get_chat_topic_by_name(tok)
+            if ct:
+                push(ct['id'])
+            else:
+                warnings.append(f"⚠️ Чат с именем <code>{tok}</code> не найден.")
+
+    if tags:
+        rows = get_chats_by_tags(tags, active_only=(pool is None))
+        if rows:
+            for row in rows:
+                push(row['id'])
+        else:
+            warnings.append(f"⚠️ Нет чатов со ВСЕМИ тегами (AND): {', '.join(tags)}.")
+
+    return ids, warnings
+
+
+
 @commands_router.message(Command("add_target"), F.from_user.id == ADMIN_ID)
 async def cmd_add_target(message: types.Message):
     if not message.text:
@@ -427,7 +521,9 @@ async def cmd_add_target(message: types.Message):
             "<b>Примеры:</b>\n"
             "<code>/add_target 1 channel_a, channel_b</code>\n"
             "<code>/add_target 1 all</code> — добавить все активные чаты (даже источники)\n"
-            "<code>/add_target 1 sendable</code> — добавить все чаты с флагом sendable",
+            "<code>/add_target 1 sendable</code> — добавить все чаты с флагом sendable\n"
+            "<code>/add_target 1 tag:asia tag:old</code> — чаты со ВСЕМИ указанными тегами (AND)\n"
+            "<code>/add_target 1 tag:asia my_channel</code> — можно смешивать теги и имена\n",
             parse_mode="HTML"
         )
         return
@@ -450,60 +546,37 @@ async def cmd_add_target(message: types.Message):
     current_targets = get_route_targets(route_id, active_only=False)
     current_target_ct_ids = {t['ct_id'] for t in current_targets}
 
-    chats_to_add = []
 
-    # 1. Обработка спец. команд
-    if targets_str.lower() == 'all':
-        chats_to_add = get_all_chat_topics(active_only=True)
-    elif targets_str.lower() == 'sendable':
-        chats_to_add = get_sendable_chat_topics()
-    else:
-        # 2. Обработка перечисления имён (поддерживаем и запятые, и пробелы)
-        names = [name.strip() for name in targets_str.replace(',', ' ').split() if name.strip()]
-        for name in names:
-            ct = get_chat_topic_by_name(name)
-            if ct:
-                chats_to_add.append(ct)
-            else:
-                await message.answer(f"⚠️ Чат с именем <code>{name}</code> не найден.", parse_mode="HTML")
-
-    if not chats_to_add:
+    ids, warnings = _select_chats(targets_str, mode='add')
+    if not ids and not warnings:
         await message.answer("Не найдено чатов для добавления.")
         return
 
     added_count = 0
     skipped_count = 0
     source_warning = False
-
-    for ct in chats_to_add:
-        # Пропускаем, если уже является целью
-        if ct['id'] in current_target_ct_ids:
+    for cid in ids:
+        if cid in current_target_ct_ids:
             skipped_count += 1
             continue
-
-        # Предупреждаем, если добавляем источник в качестве цели (но не блокируем, как просили)
-        if ct['id'] == source_ct_id:
+        if cid == source_ct_id:
             source_warning = True
-
-        if add_route_target(route_id, ct['id']):
+        if add_route_target(route_id, cid):
             added_count += 1
         else:
             skipped_count += 1
 
-    # Формируем красивый отчёт для админа
-    report = []
+    report = list(warnings)
     if added_count > 0:
         report.append(f"✅ <b>Добавлено целей:</b> {added_count}")
     if skipped_count > 0:
         report.append(f"⏭️ <b>Пропущено</b> (уже были целями или не найдены): {skipped_count}")
-    
     if source_warning:
         report.append("⚠️ <i>Внимание: среди добавленных есть исходный чат этого маршрута.</i>")
-
     if not report:
         report.append("Все указанные чаты уже являются целями этого маршрута.")
-
     await message.answer("\n".join(report), parse_mode="HTML")
+
 
 
 @commands_router.message(Command("remove_target"), F.from_user.id == ADMIN_ID)
@@ -543,62 +616,33 @@ async def cmd_remove_target(message: types.Message):
         await message.answer(f"У маршрута {route_id} нет целей.")
         return
 
-    chats_to_remove = []
 
-    # 1. Обработка спец. команд
-    if targets_str.lower() == 'all':
-        chats_to_remove = list(current_targets)
-    elif targets_str.lower() == 'sendable':
-        chats_to_remove = [t for t in current_targets if t['ct_sendable']]
-    else:
-        # 2. Обработка перечисления имён (поддерживаем и запятые, и пробелы)
-        names = [name.strip() for name in targets_str.replace(',', ' ').split() if name.strip()]
-        for name in names:
-            ct = get_chat_topic_by_name(name)
-            if ct:
-                # Проверяем, что этот чат действительно является целью маршрута
-                if any(t['ct_id'] == ct['id'] for t in current_targets):
-                    chats_to_remove.append(ct)
-                else:
-                    await message.answer(
-                        f"⚠️ Чат <code>{name}</code> не является целью маршрута {route_id}.",
-                        parse_mode="HTML"
-                    )
-            else:
-                await message.answer(
-                    f"⚠️ Чат с именем <code>{name}</code> не найден.",
-                    parse_mode="HTML"
-                )
-
-    if not chats_to_remove:
+    ids, warnings = _select_chats(targets_str, mode='remove', pool=current_targets)
+    if not ids and not warnings:
         await message.answer("Не найдено целей для удаления.")
         return
 
     removed_count = 0
     skipped_count = 0
-
-    for ct in chats_to_remove:
-        if remove_route_target(route_id, ct['id']):
+    for cid in ids:
+        if remove_route_target(route_id, cid):
             removed_count += 1
         else:
             skipped_count += 1
 
-    # Формируем отчёт
-    report = []
+    report = list(warnings)
     if removed_count > 0:
         report.append(f"✅ <b>Убрано целей:</b> {removed_count}")
     if skipped_count > 0:
         report.append(f"⏭️ <b>Пропущено:</b> {skipped_count}")
-
     if not report:
         report.append("Ни одна цель не была удалена.")
 
-    # Предупреждение, если целей не осталось
     remaining_targets = get_route_targets(route_id, active_only=False)
     if not remaining_targets:
         report.append("⚠️ <i>Внимание: у маршрута больше нет целей. Добавьте хотя бы одну через /add_target.</i>")
-
     await message.answer("\n".join(report), parse_mode="HTML")
+
 
 
 

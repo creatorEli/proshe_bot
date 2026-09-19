@@ -25,8 +25,9 @@ def init_db():
         ct_tg_chat_id INTEGER NOT NULL,
         ct_tg_topic_id INTEGER DEFAULT 0,
         ct_note TEXT DEFAULT NULL,
-        ct_sendable INTEGER DEFAULT 0,
+        ct_sendable INTEGER DEFAULT 0, 
         ct_promotable INTEGER DEFAULT 0,
+        ct_tags TEXT DEFAULT '[]',
         is_active INTEGER DEFAULT 1,
         UNIQUE(ct_tg_chat_id, ct_tg_topic_id)
     )''')
@@ -65,6 +66,13 @@ def init_db():
         buttons_json TEXT DEFAULT NULL,
         FOREIGN KEY(route_id) REFERENCES routes(id)
     )''')
+
+    # === МИГРАЦИЯ: теги чатов ===
+    try:
+        c.execute("ALTER TABLE chats_topics ADD COLUMN ct_tags TEXT DEFAULT '[]'")
+    except sqlite3.OperationalError:
+        pass  # колонка уже есть
+
     conn.commit()
     conn.close()
 
@@ -784,3 +792,95 @@ def remove_post_button(post_id: int, index: int) -> tuple[bool, str]:
     conn.commit()
     conn.close()
     return True, f"Кнопка «{removed.get('text', '?')}» удалена."
+
+
+# ============================================================
+# Теги чатов
+# ============================================================
+def normalize_tag(tag: str) -> str:
+    """Нормализует тег: lower-case, trim, пробелы -> _."""
+    return tag.strip().lower().replace(' ', '_')
+
+
+def update_chat_tags(ct_id: int, tags: list[str], mode: str = 'set') -> bool:
+    """
+    Управляет тегами чата. mode: 'set' (заменить), 'add' (добавить), 'remove' (убрать).
+    Теги нормализуются и дедуплицируются.
+    """
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute('SELECT ct_tags FROM chats_topics WHERE id = ?', (ct_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return False
+
+    try:
+        current = json.loads(row['ct_tags'] or '[]')
+    except Exception:
+        current = []
+
+    new_tags = [normalize_tag(t) for t in tags if normalize_tag(t)]
+
+    if mode == 'set':
+        result = list(dict.fromkeys(new_tags))          # дедуп с сохранением порядка
+    elif mode == 'add':
+        result = current + [t for t in new_tags if t not in current]
+    elif mode == 'remove':
+        drop = set(new_tags)
+        result = [t for t in current if t not in drop]
+    else:
+        conn.close()
+        return False
+
+    c.execute('UPDATE chats_topics SET ct_tags = ? WHERE id = ?', (json.dumps(result), ct_id))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def get_chats_by_tags(tags: list[str], active_only: bool = True, sendable_only: bool = True) -> list[sqlite3.Row]:
+    """Возвращает чаты, у которых есть ВСЕ перечисленные теги (семантика AND)."""
+    conn = _get_conn()
+    c = conn.cursor()
+    query = 'SELECT * FROM chats_topics'
+    if active_only:
+        query += ' WHERE is_active = 1'
+    if sendable_only:
+        query += ' AND ct_sendable = 1'
+    c.execute(query)
+    rows = c.fetchall()
+    conn.close()
+
+    needed = {normalize_tag(t) for t in tags if normalize_tag(t)}
+    if not needed:
+        return []
+
+    result = []
+    for row in rows:
+        try:
+            row_tags = set(json.loads(row['ct_tags'] or '[]'))
+        except Exception:
+            row_tags = set()
+        if needed.issubset(row_tags):
+            result.append(row)
+    return result
+
+
+def get_all_tags() -> dict[str, list[int]]:
+    """Возвращает словарь {тег: [id чатов]} для команды /tags."""
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute('SELECT id, ct_tags FROM chats_topics')
+    rows = c.fetchall()
+    conn.close()
+
+    tags_map: dict[str, list[int]] = {}
+    for row in rows:
+        try:
+            row_tags = json.loads(row['ct_tags'] or '[]')
+        except Exception:
+            continue
+        for t in row_tags:
+            tags_map.setdefault(t, []).append(row['id'])
+    return tags_map
