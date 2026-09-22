@@ -68,18 +68,6 @@ def init_db():
         FOREIGN KEY(route_id) REFERENCES routes(id)
     )''')
 
-    # === МИГРАЦИЯ: теги чатов ===
-    try:
-        c.execute("ALTER TABLE chats_topics ADD COLUMN ct_tags TEXT DEFAULT '[]'")
-    except sqlite3.OperationalError:
-        pass  # колонка уже есть
-
-    # === МИГРАЦИЯ: фильтр случайного пула у маршрутов ===
-    try:
-        c.execute("ALTER TABLE routes ADD COLUMN random_pool_tags TEXT DEFAULT '[]'")
-    except sqlite3.OperationalError:
-        pass  # колонка уже есть
-
     conn.commit()
     conn.close()
 
