@@ -108,7 +108,7 @@ async def send_random_post_job(route_id: int, _attempt: int = 0, manual_send: bo
 
 
 # Константа задержки между целями в секундах (5 минут = 300 сек.)
-BULK_TARGET_DELAY = 300 
+BULK_TARGET_DELAY = 600 
 
 async def _execute_singular_send(route, source_chat_id: int, post: dict, message_ids: list, manual_send: bool) -> bool:
     """Логика отправки для singular-маршрутов (по одной цели за тик)."""
