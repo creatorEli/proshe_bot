@@ -196,68 +196,88 @@ async def _execute_singular_send(route, source_chat_id: int, post: dict, message
 async def _execute_bulk_send(route, source_chat_id: int, post: dict, message_ids: list, manual_send: bool) -> bool:
     """Логика отправки для bulk-маршрутов (во все цели сразу)."""
     route_id = route['id']
-    
+
     # 1. Получаем все активные цели
     targets = get_route_targets(route_id, active_only=True)
     if not targets:
         logging.error(f"Bulk {route_id}: нет активных целей!")
         return False
 
+    # 2. Парсим кнопки (ТОЛЬКО для одиночных сообщений: Telegram не поддерживает кнопки на альбомах)
+    markup = None
+    is_album = len(message_ids) > 1
+    if not is_album and post.get('buttons_json'):
+        try:
+            buttons_data = json.loads(post['buttons_json'])
+            keyboard = [
+                [types.InlineKeyboardButton(text=btn['text'], url=btn['url'])]
+                for btn in buttons_data
+            ]
+            markup = types.InlineKeyboardMarkup(inline_keyboard=keyboard)
+        except Exception as e:
+            logging.warning(f"Ошибка парсинга кнопок для поста {post['id']}: {e}")
+
     guaranteed_ct_ids = []
-    
-    # 2. Отправляем во все гарантированные цели С ЗАДЕРЖКОЙ
+
+    # 3. Отправляем во все гарантированные цели С ЗАДЕРЖКОЙ
     for i, target in enumerate(targets):
         target_chat_id = target['ct_tg_chat_id']
         target_topic_id = target['ct_tg_topic_id']
         guaranteed_ct_ids.append(target['ct_id'])
-        
         send_kwargs = {'message_thread_id': target_topic_id} if target_topic_id else {}
 
-        # TODO: Здесь можно добавить get_note_for_target для подписей        
-        
-        # Делаем задержку перед каждой целью, КРОМЕ первой (i == 0)
         if i > 0:
             logging.info(f"Bulk {route_id}: ожидание {BULK_TARGET_DELAY} сек. перед отправкой в {target['ct_name'] or target_chat_id}...")
             await asyncio.sleep(BULK_TARGET_DELAY)
-        
-        
-        if len(message_ids) > 1 and hasattr(bot, 'copy_messages'):
+
+        if is_album and hasattr(bot, 'copy_messages'):
+            # Альбом: кнопки не прикрепляем (ограничение Telegram API)
             await bot.copy_messages(chat_id=target_chat_id, from_chat_id=source_chat_id, message_ids=message_ids, **send_kwargs)
-        else:
+        elif is_album:
+            # Фолбэк: копирование по одному, кнопок всё равно нет
             for msg_id in message_ids:
                 await bot.copy_message(chat_id=target_chat_id, from_chat_id=source_chat_id, message_id=msg_id, **send_kwargs)
+        else:
+            # Одиночное сообщение: прикрепляем кнопки
+            await bot.copy_message(
+                chat_id=target_chat_id,
+                from_chat_id=source_chat_id,
+                message_id=message_ids[0],
+                reply_markup=markup,
+                **send_kwargs,
+            )
         logging.info(f"Bulk: пост {post['id']} отправлен в {target['ct_name'] or target_chat_id}")
 
-    # 3. Обработка случайной рассылки (если включена)
+    # 4. Обработка случайной рассылки (если включена)
     if route['use_random_targets']:
-        # Читаем фильтр пула маршрута: ['asia', '-old'] и т.п.
         pool_tags = json.loads(route['random_pool_tags'] or '[]')
-
         random_pool = get_random_sendable_targets(
             exclude_ids=guaranteed_ct_ids,
-            pool_tags=pool_tags or None,   # None = старого поведения (весь sendable-пул)
+            pool_tags=pool_tags or None,
         )
-
         if random_pool:
             random_target = random.choice(random_pool)
             target_chat_id = random_target['ct_tg_chat_id']
             target_topic_id = random_target['ct_tg_topic_id']
-
             send_kwargs = {'message_thread_id': target_topic_id} if target_topic_id else {}
             logging.info(f"Bulk {route_id}: доп. случайная отправка в {random_target['ct_name'] or target_chat_id}")
-
-            # Задержка и перед случайной целью тоже
-            logging.info(f"Bulk {route_id}: ожидание {BULK_TARGET_DELAY} сек. перед случайной отправкой в {random_target['ct_name'] or target_chat_id}...")
+            logging.info(f"Bulk {route_id}: ожидание {BULK_TARGET_DELAY} сек. перед случайной отправкой...")
             await asyncio.sleep(BULK_TARGET_DELAY)
-
             try:
-                if len(message_ids) > 1 and hasattr(bot, 'copy_messages'):
+                if is_album and hasattr(bot, 'copy_messages'):
                     await bot.copy_messages(chat_id=target_chat_id, from_chat_id=source_chat_id, message_ids=message_ids, **send_kwargs)
-                else:
+                elif is_album:
                     for msg_id in message_ids:
                         await bot.copy_message(chat_id=target_chat_id, from_chat_id=source_chat_id, message_id=msg_id, **send_kwargs)
+                else:
+                    await bot.copy_message(
+                        chat_id=target_chat_id,
+                        from_chat_id=source_chat_id,
+                        message_id=message_ids[0],
+                        reply_markup=markup,
+                        **send_kwargs,
+                    )
                 logging.info(f"Bulk: пост {post['id']} отправлен в случайный чат {random_target['ct_name'] or target_chat_id}")
-
             except Exception as e:
                 logging.warning(f"Не удалось отправить в случайный чат {target_chat_id}: {e}")
         else:
@@ -265,9 +285,11 @@ async def _execute_bulk_send(route, source_chat_id: int, post: dict, message_ids
                 f"Маршрут {route_id}: случайная рассылка включена, но пул пуст "
                 f"(sendable минус гарантированные минус фильтр {pool_tags or 'без фильтра'})."
             )
-    # 4. Помечаем пост как отправленный
+
+    # 5. Помечаем пост как отправленный
     mark_post_sent(post['id'])
     return True
+
 
 
 def _schedule_next_publication(route_id: int, route):
